@@ -93,18 +93,30 @@ def run_stage_2(lang: str = "all"):
 
 def run_stage_3(lang: str = "all", classical_only: bool = False):
     """Stage 3: Compression Pipeline"""
-    from pipeline.stage3_compress import run_compression
+    from pipeline.stage3_compress import run_compression, LLMCompressor
+    from pipeline.config import INDIC_LLM_MODEL
 
     langs = LANGUAGES if lang == "all" else [lang]
 
     print("\n" + "=" * 70)
     print("  STAGE 3: COMPRESSION PIPELINE")
     print("=" * 70)
+
+    # Load the LLM once and reuse it across every language instead of
+    # reloading a 7B model from disk per language (previously: 3 loads in
+    # stage 3, another 3 in stage 4 -- 6 total for one pipeline run).
+    shared_compressor = None
+    if not classical_only:
+        shared_compressor = LLMCompressor(INDIC_LLM_MODEL)
+
     for l in langs:
-        run_compression(l, verify=True, classical_only=classical_only)
+        run_compression(l, verify=True, classical_only=classical_only,
+                         compressor=shared_compressor)
+
+    return shared_compressor
 
 
-def run_stage_4(lang: str = "all", classical_only: bool = False):
+def run_stage_4(lang: str = "all", classical_only: bool = False, compressor=None):
     """Stage 4: Benchmarking"""
     from pipeline.stage4_benchmark import run_benchmark, generate_master_table
 
@@ -114,7 +126,10 @@ def run_stage_4(lang: str = "all", classical_only: bool = False):
     print("  STAGE 4: BENCHMARKING")
     print("=" * 70)
     for l in langs:
-        run_benchmark(l, classical_only=classical_only)
+        # run_benchmark first tries to reuse Stage 3's saved LLM result for
+        # this language (same metric, no recompute needed); `compressor` is
+        # only used as a fallback if that's not available.
+        run_benchmark(l, classical_only=classical_only, compressor=compressor)
 
     generate_master_table()
 
@@ -184,15 +199,19 @@ Examples:
         ["1", "2", "3", "4", "5"] if args.stage == "all" else [args.stage]
     )
 
+    # Carries the LLM loaded in Stage 3 (if it ran) through to Stage 4 in
+    # the same process, so Stage 4 never needs to reload the 7B model.
+    llm_compressor = None
+
     for stage in stages_to_run:
         if stage == "1":
             run_stage_1(args.lang)
         elif stage == "2":
             run_stage_2(args.lang)
         elif stage == "3":
-            run_stage_3(args.lang, args.classical_only)
+            llm_compressor = run_stage_3(args.lang, args.classical_only)
         elif stage == "4":
-            run_stage_4(args.lang, args.classical_only)
+            run_stage_4(args.lang, args.classical_only, compressor=llm_compressor)
         elif stage == "5":
             run_stage_5()
 

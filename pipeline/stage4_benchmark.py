@@ -8,6 +8,32 @@ Produces the master results table:
 
 Usage:
     python -m pipeline.stage4_benchmark [--lang hindi|marathi|sanskrit|all] [--classical-only]
+
+─────────────────────────────────────────────────────────────────────────────
+CHANGES from the version that ran on Kaggle:
+
+1. Was hardcoding "ai4bharat/Airavata" instead of importing INDIC_LLM_MODEL
+   from config.py — the two could silently drift apart. Now imports the
+   same constant Stage 3 uses.
+
+2. Was reloading the 7B model AND recomputing LLM BPC from scratch for
+   every language, duplicating the exact same measurement Stage 3 already
+   made (just on a different sample size — 20K chars here vs 50K in Stage
+   3). That's why Stage 4 alone took ~3.5 hours on top of Stage 3's ~4.5
+   hours in the log you shared. Now:
+     - `run_benchmark` first tries to reuse Stage 3's saved
+       `compression_results.json` for that language (same metric, no
+       recompute needed) if it exists and succeeded.
+     - Only falls back to computing fresh (e.g. classical-only wasn't run,
+       or Stage 3's LLM result errored out) — and even then, accepts an
+       already-loaded `compressor` so the model is loaded once and shared
+       across languages instead of once per language.
+
+3. Fixed a real (separate) bug in generate_master_table(): the header line
+   `header += " {'LLM BPC':>10}"` was a plain string, not an f-string, so
+   it was literally printing the text `{'LLM BPC':>10}` in the table header
+   instead of formatting "LLM BPC" right-aligned to width 10.
+─────────────────────────────────────────────────────────────────────────────
 """
 
 import argparse
@@ -26,7 +52,7 @@ from tqdm import tqdm
 
 from pipeline.config import (
     SPLIT_DIR, TOKENIZER_DIR, RESULTS_DIR, LANGUAGES,
-    CLASSICAL_COMPRESSORS, ensure_dirs
+    CLASSICAL_COMPRESSORS, INDIC_LLM_MODEL, ensure_dirs
 )
 
 
@@ -162,8 +188,35 @@ def benchmark_classical_compressors(text: str, label: str) -> dict:
     return results
 
 
-def run_benchmark(lang: str, classical_only: bool = False):
-    """Run full benchmark for a language."""
+def _load_stage3_llm_result(lang: str):
+    """
+    Look for a usable LLM result already computed by Stage 3 for this
+    language, so Stage 4 doesn't reload the 7B model and recompute the same
+    thing again. Returns the dict, or None if not available/unusable.
+    """
+    results_file = RESULTS_DIR / lang / "compression_results.json"
+    if not results_file.exists():
+        return None
+    try:
+        with open(results_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+    llm = data.get("llm_compression")
+    if not llm or "error" in llm:
+        return None
+    return llm
+
+
+def run_benchmark(lang: str, classical_only: bool = False, compressor=None):
+    """
+    Run full benchmark for a language.
+
+    `compressor`: an already-loaded LLMCompressor to reuse (avoids
+    reloading the 7B model per language). Only used if Stage 3's result
+    can't be reused and a fresh LLM computation is actually needed.
+    """
     ensure_dirs()
 
     test_file = SPLIT_DIR / lang / "test.txt"
@@ -202,24 +255,34 @@ def run_benchmark(lang: str, classical_only: bool = False):
 
     # LLM compression benchmarks (if not classical-only)
     if not classical_only:
-        try:
-            from pipeline.stage3_compress import LLMCompressor
-            print(f"\n  --- LLM Compression ---")
+        print(f"\n  --- LLM Compression ---")
 
-            compressor = LLMCompressor("ai4bharat/Airavata")
+        reused = _load_stage3_llm_result(lang)
+        if reused is not None:
+            print(f"  Reusing LLM BPC already computed in Stage 3 "
+                  f"(no reload, no recompute)")
+            all_results["llm_default_tokenizer"] = reused
+            print(f"    LLM BPC: {reused['bpc']:.4f}")
+            print(f"    Compression ratio: {reused['compression_ratio']:.3f}")
+        else:
+            try:
+                from pipeline.stage3_compress import LLMCompressor
 
-            # BPC on sample (LLM is slow, use smaller sample)
-            sample = test_text[:20_000]
-            print(f"  Computing LLM BPC on {len(sample):,} chars...")
-            bpc_result = compressor.compute_bpc(sample)
-            all_results["llm_default_tokenizer"] = bpc_result
+                if compressor is None:
+                    compressor = LLMCompressor(INDIC_LLM_MODEL)
 
-            print(f"    LLM BPC: {bpc_result['bpc']:.4f}")
-            print(f"    Compression ratio: {bpc_result['compression_ratio']:.3f}")
+                # BPC on sample (LLM is slow, use smaller sample)
+                sample = test_text[:20_000]
+                print(f"  Computing LLM BPC on {len(sample):,} chars...")
+                bpc_result = compressor.compute_bpc(sample)
+                all_results["llm_default_tokenizer"] = bpc_result
 
-        except Exception as e:
-            print(f"  LLM benchmark error: {e}")
-            all_results["llm_default_tokenizer"] = {"error": str(e)}
+                print(f"    LLM BPC: {bpc_result['bpc']:.4f}")
+                print(f"    Compression ratio: {bpc_result['compression_ratio']:.3f}")
+
+            except Exception as e:
+                print(f"  LLM benchmark error: {e}")
+                all_results["llm_default_tokenizer"] = {"error": str(e)}
 
     # Save full results
     results_file = RESULTS_DIR / lang / "benchmark_results.json"
@@ -259,7 +322,7 @@ def generate_master_table(results_dir: Path = None):
     header = f"  {'Language':<12} {'Chars':>10} {'Bytes':>10} {'Entropy':>8}"
     for c in compressors:
         header += f" {c:>10}"
-    header += " {'LLM BPC':>10}"
+    header += f" {'LLM BPC':>10}"   # FIX: was a plain string, never formatted
 
     print(header)
     print("  " + "─" * (len(header) - 2))
