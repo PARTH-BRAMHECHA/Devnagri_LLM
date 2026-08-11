@@ -1,0 +1,58 @@
+# Datasets
+data/
+*.csv
+*.json
+*.jsonl
+*.txt
+*.parquet
+*.zip
+*.gz
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Models / checkpoints
+*.pt
+*.pth
+*.bin
+*.safetensors
+checkpoints/
+models/
+
+# Logs
+logs/
+*.log
+
+# Environment variables
+.env
+.env.*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Virtual environment
+venv/
+.venv/
+
+# Dataset
+data/
+
+venv/
+.venv/
+data/
+
+__pycache__/
+*.pyc
+
+.env
+.env.*
+
+.ipynb_checkpoints/

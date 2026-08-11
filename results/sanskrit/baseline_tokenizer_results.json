@@ -1,0 +1,54 @@
+[
+  {
+    "tokenizer": "SP-BPE-sanskrit",
+    "model_path": "C:\\Users\\ASUS Vivobook\\Desktop\\devnagari-compression\\tokenizer\\sanskrit\\sp_bpe_sanskrit.model",
+    "sentences": 3855,
+    "avg_tokens_per_sentence": 49.73,
+    "total_tokens": 191716,
+    "total_chars": 842947,
+    "tokens_per_char": 0.2274,
+    "vowel_split_pct": 8.52
+  },
+  {
+    "tokenizer": "SP-Unigram-sanskrit",
+    "model_path": "C:\\Users\\ASUS Vivobook\\Desktop\\devnagari-compression\\tokenizer\\sanskrit\\sp_unigram_sanskrit.model",
+    "sentences": 3855,
+    "avg_tokens_per_sentence": 50.88,
+    "total_tokens": 196128,
+    "total_chars": 842947,
+    "tokens_per_char": 0.2327,
+    "vowel_split_pct": 10.15
+  },
+  {
+    "tokenizer": "gpt2",
+    "model_path": "openai-community/gpt2",
+    "sentences": 3855,
+    "avg_tokens_per_sentence": 367.12,
+    "total_tokens": 1415263,
+    "total_chars": 842947,
+    "tokens_per_char": 1.6789,
+    "vowel_split_pct": 0.0
+  },
+  {
+    "tokenizer": "Llama-2-7b-hf",
+    "model_path": "meta-llama/Llama-2-7b-hf",
+    "error": "You are trying to access a gated repo.\nMake sure to have access to it at https://huggingface.co/meta-llama/Llama-2-7b-hf.\n403 Client Error. (Request ID: Root=1-6a79c2a8-028f631430654fa96e370a7c;c1e7df81-c614-4e7d-9a95-e4e2a1c05add)\n\nCannot access gated repo for url https://huggingface.co/meta-llama/Llama-2-7b-hf/resolve/main/config.json.\nAccess to model meta-llama/Llama-2-7b-hf is restricted and you are not in the authorized list. Visit https://huggingface.co/meta-llama/Llama-2-7b-hf to ask for access.",
+    "hint": "This looks like a gated HuggingFace repo. Request access on the model page, then run `huggingface-cli login` (or set env var HF_TOKEN) before re-running this stage."
+  },
+  {
+    "tokenizer": "gemma-2b",
+    "model_path": "google/gemma-2b",
+    "error": "You are trying to access a gated repo.\nMake sure to have access to it at https://huggingface.co/google/gemma-2b.\n403 Client Error. (Request ID: Root=1-6a79c2a8-624b8e8c39d01c69177da01e;b4f375bd-6b21-42a5-b13f-b61b21e05e64)\n\nCannot access gated repo for url https://huggingface.co/google/gemma-2b/resolve/main/config.json.\nYour request to access model google/gemma-2b is awaiting a review from the repo authors.",
+    "hint": "This looks like a gated HuggingFace repo. Request access on the model page, then run `huggingface-cli login` (or set env var HF_TOKEN) before re-running this stage."
+  },
+  {
+    "tokenizer": "IndicBERTv2-MLM-only",
+    "model_path": "ai4bharat/IndicBERTv2-MLM-only",
+    "sentences": 3855,
+    "avg_tokens_per_sentence": 62.35,
+    "total_tokens": 240371,
+    "total_chars": 842947,
+    "tokens_per_char": 0.2852,
+    "vowel_split_pct": 15.56
+  }
+]

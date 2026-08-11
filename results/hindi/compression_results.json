@@ -1,0 +1,36 @@
+{
+  "language": "hindi",
+  "classical": {
+    "gzip": {
+      "compressed_bytes": 1178348,
+      "ratio": 4.8403,
+      "bpc": 4.2005,
+      "bpb": 1.6528
+    },
+    "bzip2": {
+      "compressed_bytes": 802586,
+      "ratio": 7.1065,
+      "bpc": 2.861,
+      "bpb": 1.1257
+    },
+    "lzma": {
+      "compressed_bytes": 835072,
+      "ratio": 6.83,
+      "bpc": 2.9768,
+      "bpb": 1.1713
+    },
+    "zstd": {
+      "compressed_bytes": 850649,
+      "ratio": 6.7049,
+      "bpc": 3.0324,
+      "bpb": 1.1931
+    },
+    "_meta": {
+      "original_bytes": 5703559,
+      "original_chars": 2244197
+    }
+  },
+  "llm_compression": {
+    "error": "You are trying to access a gated repo.\nMake sure to have access to it at https://huggingface.co/ai4bharat/Airavata.\n403 Client Error. (Request ID: Root=1-6a79c403-7c9192cb61125a1a65d5a236;0b96f8a8-6d73-4ade-b57f-52faf33ec685)\n\nCannot access gated repo for url https://huggingface.co/ai4bharat/Airavata/resolve/main/config.json.\nAccess to model ai4bharat/Airavata is restricted and you are not in the authorized list. Visit https://huggingface.co/ai4bharat/Airavata to ask for access."
+  }
+}

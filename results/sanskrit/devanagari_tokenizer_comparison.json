@@ -1,0 +1,22 @@
+{
+  "devanagari_aware": {
+    "tokenizer": "DevAware-BPE-sanskrit",
+    "model_path": "C:\\Users\\ASUS Vivobook\\Desktop\\devnagari-compression\\tokenizer\\sanskrit\\devaware_bpe_sanskrit.model",
+    "sentences": 3855,
+    "avg_tokens_per_sentence": 109.63,
+    "total_tokens": 422612,
+    "total_chars": 842947,
+    "tokens_per_char": 0.5014,
+    "vowel_split_pct": 3.63
+  },
+  "baseline_bpe": {
+    "tokenizer": "SP-BPE-sanskrit",
+    "model_path": "C:\\Users\\ASUS Vivobook\\Desktop\\devnagari-compression\\tokenizer\\sanskrit\\sp_bpe_sanskrit.model",
+    "sentences": 3855,
+    "avg_tokens_per_sentence": 49.73,
+    "total_tokens": 191716,
+    "total_chars": 842947,
+    "tokens_per_char": 0.2274,
+    "vowel_split_pct": 8.52
+  }
+}

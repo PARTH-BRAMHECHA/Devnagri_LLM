@@ -1,0 +1,41 @@
+# Core ML
+torch
+torchvision
+torchaudio
+transformers
+accelerate
+
+# Tokenization
+sentencepiece
+tokenizers
+protobuf
+
+# Data
+datasets
+huggingface_hub
+requests
+beautifulsoup4
+lxml
+wikiextractor
+
+# Indic NLP
+indic-nlp-library
+regex
+sacremoses
+
+# Compression
+range-coder
+
+# Utilities
+tqdm
+pandas
+numpy
+matplotlib
+seaborn
+tabulate
+
+# Logging
+loguru
+
+# Document reading (for docx support)
+python-docx

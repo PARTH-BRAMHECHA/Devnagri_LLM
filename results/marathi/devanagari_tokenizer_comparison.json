@@ -1,0 +1,22 @@
+{
+  "devanagari_aware": {
+    "tokenizer": "DevAware-BPE-marathi",
+    "model_path": "C:\\Users\\ASUS Vivobook\\Desktop\\devnagari-compression\\tokenizer\\marathi\\devaware_bpe_marathi.model",
+    "sentences": 5000,
+    "avg_tokens_per_sentence": 64.29,
+    "total_tokens": 321466,
+    "total_chars": 636992,
+    "tokens_per_char": 0.5047,
+    "vowel_split_pct": 1.03
+  },
+  "baseline_bpe": {
+    "tokenizer": "SP-BPE-marathi",
+    "model_path": "C:\\Users\\ASUS Vivobook\\Desktop\\devnagari-compression\\tokenizer\\marathi\\sp_bpe_marathi.model",
+    "sentences": 5000,
+    "avg_tokens_per_sentence": 27.11,
+    "total_tokens": 135549,
+    "total_chars": 636992,
+    "tokens_per_char": 0.2128,
+    "vowel_split_pct": 2.26
+  }
+}

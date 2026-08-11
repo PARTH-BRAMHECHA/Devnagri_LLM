@@ -1,0 +1,22 @@
+{
+  "devanagari_aware": {
+    "tokenizer": "DevAware-BPE-hindi",
+    "model_path": "C:\\Users\\ASUS Vivobook\\Desktop\\devnagari-compression\\tokenizer\\hindi\\devaware_bpe_hindi.model",
+    "sentences": 5000,
+    "avg_tokens_per_sentence": 133.93,
+    "total_tokens": 669673,
+    "total_chars": 1334381,
+    "tokens_per_char": 0.5019,
+    "vowel_split_pct": 1.08
+  },
+  "baseline_bpe": {
+    "tokenizer": "SP-BPE-hindi",
+    "model_path": "C:\\Users\\ASUS Vivobook\\Desktop\\devnagari-compression\\tokenizer\\hindi\\sp_bpe_hindi.model",
+    "sentences": 5000,
+    "avg_tokens_per_sentence": 67.79,
+    "total_tokens": 338941,
+    "total_chars": 1334381,
+    "tokens_per_char": 0.254,
+    "vowel_split_pct": 2.37
+  }
+}
