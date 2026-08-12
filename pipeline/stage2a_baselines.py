@@ -84,14 +84,10 @@ def train_sentencepiece(lang: str, model_type: str = "bpe"):
         model_type=model_type,
         character_coverage=SENTENCEPIECE_CHARACTER_COVERAGE,
         normalization_rule_name="nfkc",
+        # Devanagari-specific settings
         byte_fallback=True,
         split_digits=True,
-
-        # Faster SentencePiece training
-        seed_sentencepiece_size=100000,
-        num_sub_iterations=1,
         num_threads=os.cpu_count() or 4,
-
         max_sentence_length=16384,
     )
 
