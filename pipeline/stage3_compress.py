@@ -348,6 +348,9 @@ class LLMCompressor:
 
         self.vocab_size = self.model.config.vocab_size
         print(f"  Model loaded. Vocab size: {self.vocab_size}")
+        print(f"  torch.cuda.is_available(): {torch.cuda.is_available()}")
+        print(f"  Model actually on device: {next(self.model.parameters()).device}")
+        sys.stdout.flush()
 
     @torch.no_grad()
     def _forward_probs(self, input_ids: torch.Tensor, past=None):
@@ -398,13 +401,19 @@ class LLMCompressor:
         # Subsequent tokens: use LLM predictions, with a sliding KV cache so
         # this is O(n) instead of O(n^2).
         kv = _SlidingKVCache(self, context_length)
-        for i in tqdm(range(1, n_tokens), desc="Compressing", unit=" tokens",
-                      disable=(n_tokens < 100)):
+        t_start = time.time()
+        for i in range(1, n_tokens):
             probs = kv.feed_and_predict(token_ids, i)
             total_log_prob += math.log2(max(probs[token_ids[i]], 1e-30))
 
             cum_probs = probs_to_cumulative(probs)
             encoder.encode_symbol(cum_probs, token_ids[i])
+
+            if i % 20 == 0 or i == n_tokens - 1:
+                elapsed = time.time() - t_start
+                rate = i / max(elapsed, 1e-6)
+                print(f"    [compress] {i}/{n_tokens - 1} tokens, "
+                      f"{elapsed:.1f}s elapsed, {rate:.2f} tok/s", flush=True)
 
         compressed = encoder.finish()
 
@@ -435,13 +444,19 @@ class LLMCompressor:
         # Decode subsequent tokens using LLM predictions (same sliding cache
         # scheme as compress(), so encode/decode stay symmetric and fast).
         kv = _SlidingKVCache(self, context_length)
-        for i in tqdm(range(1, n_tokens), desc="Decompressing", unit=" tokens",
-                      disable=(n_tokens < 100)):
+        t_start = time.time()
+        for i in range(1, n_tokens):
             probs = kv.feed_and_predict(token_ids, i)
             cum_probs = probs_to_cumulative(probs)
 
             symbol = decoder.decode_symbol(cum_probs)
             token_ids.append(symbol)
+
+            if i % 20 == 0 or i == n_tokens - 1:
+                elapsed = time.time() - t_start
+                rate = i / max(elapsed, 1e-6)
+                print(f"    [decompress] {i}/{n_tokens - 1} tokens, "
+                      f"{elapsed:.1f}s elapsed, {rate:.2f} tok/s", flush=True)
 
         return self.tokenizer.decode(token_ids, skip_special_tokens=True)
 
@@ -464,11 +479,17 @@ class LLMCompressor:
         total_bits += math.log2(self.vocab_size)
 
         kv = _SlidingKVCache(self, context_length)
-        for i in tqdm(range(1, n_tokens), desc="Computing BPC", unit=" tokens",
-                      disable=(n_tokens < 100)):
+        t_start = time.time()
+        for i in range(1, n_tokens):
             probs = kv.feed_and_predict(token_ids, i)
             prob = max(probs[token_ids[i]], 1e-30)
             total_bits += -math.log2(prob)
+
+            if i % 20 == 0 or i == n_tokens - 1:
+                elapsed = time.time() - t_start
+                rate = i / max(elapsed, 1e-6)
+                print(f"    [bpc] {i}/{n_tokens - 1} tokens, "
+                      f"{elapsed:.1f}s elapsed, {rate:.2f} tok/s", flush=True)
 
         bpc = total_bits / text_chars
         bpb = total_bits / text_bytes
