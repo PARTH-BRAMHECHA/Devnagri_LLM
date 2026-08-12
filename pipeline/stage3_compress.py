@@ -351,6 +351,7 @@ class LLMCompressor:
         print(f"  torch.cuda.is_available(): {torch.cuda.is_available()}")
         print(f"  Model actually on device: {next(self.model.parameters()).device}")
         sys.stdout.flush()
+        self._debug_calls = 0
 
     @torch.no_grad()
     def _forward_probs(self, input_ids: torch.Tensor, past=None):
@@ -361,9 +362,28 @@ class LLMCompressor:
         float16-overflow / float16-underflow bugs described at the top of
         this file. Never do probability math in float16.
         """
+        debug = self._debug_calls < 10
+        if debug:
+            t0 = time.time()
+            print(f"    [fwd #{self._debug_calls}] input_ids shape={tuple(input_ids.shape)}, "
+                  f"device={input_ids.device}, has_past={past is not None} -- calling model...",
+                  flush=True)
+
         outputs = self.model(input_ids, past_key_values=past, use_cache=True)
+
+        if debug:
+            torch.cuda.synchronize() if input_ids.is_cuda else None
+            print(f"    [fwd #{self._debug_calls}] model() returned in {time.time()-t0:.2f}s",
+                  flush=True)
+
         logits = outputs.logits[0, -1, :]
         probs = torch.softmax(logits.float(), dim=0).cpu().numpy().astype(np.float64)
+
+        if debug:
+            print(f"    [fwd #{self._debug_calls}] softmax+cpu done, total {time.time()-t0:.2f}s",
+                  flush=True)
+            self._debug_calls += 1
+
         return probs, outputs.past_key_values
 
     @torch.no_grad()
@@ -390,6 +410,7 @@ class LLMCompressor:
         # Tokenize
         token_ids = self.tokenizer.encode(text, add_special_tokens=True)
         n_tokens = len(token_ids)
+        print(f"    [compress] tokenized: {n_tokens} tokens", flush=True)
 
         encoder = ArithmeticEncoder()
         total_log_prob = 0.0
