@@ -132,6 +132,15 @@ FINETUNE_LOG_EVERY = 20
 # the paper's methodology section.
 FINETUNE_MAX_TRAIN_CHARS = 20_000_000
 
+# Hard wall-clock budget (seconds) for ONE language's fine-tune call. This
+# is a Kaggle-12h-session-budget knob, not a methodology choice -- when hit,
+# the training loop checkpoints immediately and returns early instead of
+# running to FINETUNE_STEPS. Re-running the same command resumes from that
+# checkpoint. Default leaves headroom in a 12h session for Stage 2 (~1h)
+# plus two more languages' worth of budget; override with --max-hours on
+# the CLI if you're giving a single language a whole session to itself.
+FINETUNE_MAX_WALL_SECONDS = 3 * 3600  # 3h/language default
+
 # ─── Logging ─────────────────────────────────────────────────────────────────
 LOG_LEVEL = "INFO"
 LOG_FILE = LOGS_DIR / "pipeline.log"
