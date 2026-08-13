@@ -164,21 +164,27 @@ def apply_lora_and_unfreeze_embeddings(model):
         model, use_gradient_checkpointing=True
     )
 
+    # `modules_to_save` (not a manual requires_grad loop) is peft's
+    # native mechanism for "fully fine-tune this whole module, not just a
+    # LoRA delta, and make save_pretrained/from_pretrained round-trip it
+    # correctly." peft wraps each named module in a ModulesToSaveWrapper
+    # that keeps a frozen original + a trainable copy (initialized from
+    # the module's current weights -- i.e. our smart-initialized
+    # embeddings, since this runs after that step), and both
+    # save_pretrained and from_pretrained know to persist/restore the
+    # trainable copy as part of the adapter checkpoint. This replaces an
+    # earlier version that set requires_grad=True by hand and hoped
+    # peft's embedding-resize auto-detection would catch it on save --
+    # this is the tested path instead of an assumption.
     lora_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         r=LORA_R,
         lora_alpha=LORA_ALPHA,
         lora_dropout=LORA_DROPOUT,
         target_modules=LORA_TARGET_MODULES,
+        modules_to_save=["embed_tokens", "lm_head"],
     )
     model = get_peft_model(model, lora_config)
-
-    # peft freezes everything except LoRA params by default. The whole
-    # point here is that the new tokens' meaning lives in the embedding /
-    # LM head, so those need to be trainable too, not just the adapters.
-    for name, param in model.named_parameters():
-        if "embed_tokens" in name or "lm_head" in name:
-            param.requires_grad = True
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
@@ -237,16 +243,36 @@ def finetune(model, tokenizer, train_text: str, device: str, save_dir: Path,
         [p for p in model.parameters() if p.requires_grad], lr=FINETUNE_LR
     )
     total_steps = min(FINETUNE_STEPS, len(loader) * 50)  # don't schedule past what data supports many epochs of
+
+    # Resume: restore actual Adam momentum/variance state (not just model
+    # weights), and construct the scheduler at last_epoch=start_step-1 so
+    # its internal __init__ step() lands it exactly back on the LR the
+    # warmup/decay schedule would have produced at this step -- not a
+    # restart of the schedule. `initial_lr` has to be seeded manually
+    # since this optimizer was just constructed fresh (last_epoch!=-1
+    # normally expects a scheduler to have already set it once before).
+    if start_step > 0:
+        opt_path = save_dir / f"step_{start_step}" / "optimizer.pt"
+        if opt_path.exists():
+            optimizer.load_state_dict(torch.load(opt_path, map_location=device))
+            print(f"  ✓ Restored optimizer (Adam momentum/variance) state from {opt_path}")
+        else:
+            print(f"  ⚠ No optimizer.pt at {opt_path} -- resuming with fresh "
+                  f"Adam state (momentum reset, model weights unaffected).")
+    for group in optimizer.param_groups:
+        group.setdefault("initial_lr", FINETUNE_LR)
+
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
         lambda step: min(1.0, step / max(1, FINETUNE_WARMUP_STEPS))
         * max(0.0, (total_steps - step) / max(1, total_steps)),
+        last_epoch=start_step - 1 if start_step > 0 else -1,
     )
-    # NOTE: resume re-creates the optimizer/scheduler fresh at start_step
-    # rather than restoring exact Adam momentum -- checkpoints only save
-    # model weights, not optimizer state. That's a stated simplification,
-    # not a hidden one: it costs a brief LR/momentum discontinuity right
-    # after a resume, not correctness.
+    # Remaining honest gap, much smaller than before: if the wall-clock
+    # cutoff lands mid-way through an 8-step grad-accum window, whatever
+    # gradient had accumulated in that unfinished window (never applied,
+    # never saved) is lost on resume -- at most a slightly noisier single
+    # update right at the resume boundary, not a correctness issue.
 
     if start_step >= total_steps:
         print(f"  ✓ {start_step} steps already done (target {total_steps}) -- "
@@ -294,7 +320,7 @@ def finetune(model, tokenizer, train_text: str, device: str, save_dir: Path,
                   f"({elapsed:.0f}s elapsed / {max_wall_seconds:.0f}s budget)", flush=True)
 
         if step > 0 and step % FINETUNE_SAVE_EVERY == 0:
-            _save_checkpoint(model, tokenizer, save_dir, step)
+            _save_checkpoint(model, tokenizer, save_dir, step, optimizer=optimizer)
 
         step += 1
 
@@ -302,7 +328,7 @@ def finetune(model, tokenizer, train_text: str, device: str, save_dir: Path,
         print(f"  ⏱ Wall-clock budget ({max_wall_seconds:.0f}s) hit at step "
               f"{step}/{total_steps} -- checkpointing and stopping early. "
               f"Re-run the exact same command to resume from here.")
-        _save_checkpoint(model, tokenizer, save_dir, step)
+        _save_checkpoint(model, tokenizer, save_dir, step, optimizer=optimizer)
         model.eval()
         return model
 
@@ -311,11 +337,16 @@ def finetune(model, tokenizer, train_text: str, device: str, save_dir: Path,
     return model
 
 
-def _save_checkpoint(model, tokenizer, save_dir: Path, step: int, final: bool = False):
+def _save_checkpoint(model, tokenizer, save_dir: Path, step: int,
+                      final: bool = False, optimizer=None):
     out_dir = save_dir / ("final" if final else f"step_{step}")
     out_dir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(out_dir)   # saves LoRA adapter + resized embed/head
     tokenizer.save_pretrained(out_dir)
+    if optimizer is not None:
+        # Not saved for 'final' -- nothing resumes past a completed run,
+        # no need to carry Adam state around after training is done.
+        torch.save(optimizer.state_dict(), out_dir / "optimizer.pt")
     print(f"  ✓ Checkpoint saved: {out_dir}")
 
 
