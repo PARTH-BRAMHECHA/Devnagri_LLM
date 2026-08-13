@@ -64,6 +64,7 @@ Usage:
 """
 
 import argparse
+import gc
 import json
 import math
 import time
@@ -83,6 +84,35 @@ from pipeline.config import (
 )
 from pipeline.devaware_tokenizer import DevAwareTokenizer
 from pipeline.stage2b_devanagari_tokenizer import segment_into_aksharas
+
+
+# ─── CUDA OOM safety net ─────────────────────────────────────────────────────
+#
+# Two crashes were observed on a 16GB Kaggle GPU: one while resuming a
+# checkpoint (PeftModel.from_pretrained), one inside optimizer.step(). Full
+# fine-tuning of embed_tokens/lm_head (required because new vocab tokens are
+# added) makes their optimizer state large, and there's a real risk of GPU
+# memory being left fragmented (visible as "reserved but unallocated" in the
+# CUDA OOM message) if a run dies and the SAME Kaggle kernel is reused for
+# the next attempt -- Python doesn't release CUDA memory just because an
+# exception was raised while a debugger/traceback still references the
+# tensors. `_cuda_cleanup()` is best-effort hygiene for that; it cannot force
+# a leaked reference to be freed, hence the explicit kernel-restart advice
+# below when an OOM is actually hit.
+def _cuda_cleanup():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+_OOM_RESTART_MSG = (
+    "  ✗ CUDA out of memory. If this keeps happening on retry within the "
+    "same notebook session, RESTART THE KAGGLE KERNEL before re-running --  "
+    "a crashed CUDA context can leave memory reserved-but-unusable that "
+    "torch.cuda.empty_cache() cannot reclaim from here. Re-running the same "
+    "command after a fresh kernel start will resume from the last "
+    "checkpoint automatically."
+)
 
 
 # ─── Step 1: find genuinely novel merged pieces ─────────────────────────────
@@ -239,9 +269,24 @@ def finetune(model, tokenizer, train_text: str, device: str, save_dir: Path,
 
     loader = DataLoader(dataset, batch_size=FINETUNE_BATCH_SIZE, shuffle=True)
 
-    optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad], lr=FINETUNE_LR
-    )
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+
+    # 8-bit AdamW (bitsandbytes) instead of full-precision AdamW: the
+    # trainable set here includes the FULLY fine-tuned embed_tokens/lm_head
+    # (large tensors, since vocab was extended), and plain AdamW keeps two
+    # fp32 state tensors per param -- roughly 4x that tensor's own memory.
+    # 8-bit state cuts that to ~1x, which is what actually fixed the
+    # optimizer.step() OOM observed on a 16GB GPU. Falls back to regular
+    # AdamW (with a warning) if bitsandbytes isn't installed.
+    try:
+        import bitsandbytes as bnb
+        optimizer = bnb.optim.AdamW8bit(trainable_params, lr=FINETUNE_LR)
+        print("  Using bitsandbytes 8-bit AdamW (reduced optimizer memory).")
+    except ImportError:
+        print("  ⚠ bitsandbytes not available -- falling back to full-precision "
+              "AdamW. This uses substantially more GPU memory and is more "
+              "likely to OOM; `pip install bitsandbytes` is recommended.")
+        optimizer = torch.optim.AdamW(trainable_params, lr=FINETUNE_LR)
     total_steps = min(FINETUNE_STEPS, len(loader) * 50)  # don't schedule past what data supports many epochs of
 
     # Resume: restore actual Adam momentum/variance state (not just model
@@ -300,17 +345,42 @@ def finetune(model, tokenizer, train_text: str, device: str, save_dir: Path,
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
 
-        outputs = model(input_ids=input_ids, labels=labels)
-        loss = outputs.loss / FINETUNE_GRAD_ACCUM_STEPS
-        loss.backward()
+        try:
+            outputs = model(input_ids=input_ids, labels=labels)
+            loss = outputs.loss / FINETUNE_GRAD_ACCUM_STEPS
+            loss.backward()
 
-        if (step + 1) % FINETUNE_GRAD_ACCUM_STEPS == 0:
-            torch.nn.utils.clip_grad_norm_(
-                [p for p in model.parameters() if p.requires_grad], 1.0
-            )
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
+            if (step + 1) % FINETUNE_GRAD_ACCUM_STEPS == 0:
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in model.parameters() if p.requires_grad], 1.0
+                )
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+        except torch.OutOfMemoryError:
+            # Save whatever we've got before anything else touches the GPU,
+            # then clean up and fail loudly with actionable advice instead
+            # of leaving a half-updated model / dangling CUDA context.
+            print(f"\n{_OOM_RESTART_MSG}\n  (OOM at step {step}/{total_steps} -- "
+                  f"attempting an emergency checkpoint before exiting.)")
+            optimizer.zero_grad(set_to_none=True)
+            _cuda_cleanup()
+            try:
+                _save_checkpoint(model, tokenizer, save_dir, step)
+                print(f"  ✓ Emergency checkpoint saved at step {step} -- "
+                      f"restart the kernel, then re-run the same command to resume.")
+            except torch.OutOfMemoryError:
+                print("  ✗ Could not even save an emergency checkpoint -- GPU "
+                      "memory is too fragmented. Restart the kernel and re-run; "
+                      "training will resume from the last periodic checkpoint "
+                      f"(every {FINETUNE_SAVE_EVERY} steps) instead.")
+            raise
+
+        # Periodic cache clear: gradient checkpointing + long training loops
+        # fragment the CUDA allocator over many steps, which is part of why
+        # the resume/optimizer OOMs got worse on later steps/attempts.
+        if step % FINETUNE_LOG_EVERY == 0:
+            _cuda_cleanup()
 
         if step % FINETUNE_LOG_EVERY == 0:
             elapsed = time.time() - t0
@@ -419,6 +489,11 @@ def build_vocab_extended_model(lang: str, device: str = None,
     max_wall_seconds = (FINETUNE_MAX_WALL_SECONDS if max_wall_seconds is None
                          else max_wall_seconds)
 
+    # Best-effort reclaim of any memory left dangling by a previous crashed
+    # attempt in this same process/kernel (see _cuda_cleanup docstring above
+    # -- this cannot fix real leaks/fragmentation, only reduce their odds).
+    _cuda_cleanup()
+
     save_dir = FINETUNE_DIR / lang
     final_dir = save_dir / "final"
 
@@ -435,11 +510,16 @@ def build_vocab_extended_model(lang: str, device: str = None,
 
     if resume_dir is not None:
         print(f"  ↻ Resuming {lang} fine-tune from {resume_dir} (step {resume_step})")
-        base_tokenizer = AutoTokenizer.from_pretrained(resume_dir, trust_remote_code=True)
-        model = _load_quantized_base(device)
-        model.resize_token_embeddings(len(base_tokenizer))
-        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
-        model = PeftModel.from_pretrained(model, resume_dir, is_trainable=True)
+        try:
+            base_tokenizer = AutoTokenizer.from_pretrained(resume_dir, trust_remote_code=True)
+            model = _load_quantized_base(device)
+            model.resize_token_embeddings(len(base_tokenizer))
+            model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+            model = PeftModel.from_pretrained(model, resume_dir, is_trainable=True)
+        except torch.OutOfMemoryError:
+            print(_OOM_RESTART_MSG)
+            _cuda_cleanup()
+            raise
 
         train_file = SPLIT_DIR / lang / "train.txt"
         with open(train_file, "r", encoding="utf-8") as f:
@@ -456,8 +536,13 @@ def build_vocab_extended_model(lang: str, device: str = None,
     )
 
     print(f"  Loading base tokenizer + model (4-bit): {INDIC_LLM_MODEL}")
-    base_tokenizer = AutoTokenizer.from_pretrained(INDIC_LLM_MODEL, trust_remote_code=True)
-    model = _load_quantized_base(device)
+    try:
+        base_tokenizer = AutoTokenizer.from_pretrained(INDIC_LLM_MODEL, trust_remote_code=True)
+        model = _load_quantized_base(device)
+    except torch.OutOfMemoryError:
+        print(_OOM_RESTART_MSG)
+        _cuda_cleanup()
+        raise
 
     print(f"  Finding novel multi-akshara merges (base vocab size={len(base_tokenizer)})...")
     new_tokens = find_novel_merged_pieces(dev_tok, base_tokenizer)
