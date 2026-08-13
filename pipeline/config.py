@@ -120,8 +120,14 @@ LORA_TARGET_MODULES = [
 
 # Continued-pretraining hyperparameters
 FINETUNE_BLOCK_SIZE = 512
-FINETUNE_BATCH_SIZE = 2
-FINETUNE_GRAD_ACCUM_STEPS = 8
+# Lowered from 2 -> 1 (and grad-accum doubled 8 -> 16 to keep the same
+# effective batch of 16*512=8192 tokens/update) after repeated CUDA OOM
+# crashes on a 16GB Kaggle GPU: embed_tokens + lm_head are fully
+# fine-tuned (not just LoRA-adapted) because of the added vocab, so their
+# activation + optimizer-state memory is large. See finetune()'s use of
+# 8-bit AdamW for the other half of this fix.
+FINETUNE_BATCH_SIZE = 1
+FINETUNE_GRAD_ACCUM_STEPS = 16
 FINETUNE_LR = 2e-4
 FINETUNE_STEPS = 1000
 FINETUNE_WARMUP_STEPS = 50
