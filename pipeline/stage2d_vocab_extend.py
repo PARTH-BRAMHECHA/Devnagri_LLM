@@ -36,15 +36,23 @@ Kaggle session budget supports):
    gives the new tokens a much better starting point than random init, which
    directly reduces the fine-tuning budget needed to make them useful.
 
-3. LORA + FULL EMBEDDING FINE-TUNE. The transformer blocks get LoRA
-   adapters (cheap, a few million trainable params). The embedding matrix
-   and LM head are fine-tuned in full -- they're the piece that actually
-   needs to learn what the new tokens mean, and full fine-tuning there is
-   still small relative to the frozen backbone.
+3. QLORA + FULL EMBEDDING FINE-TUNE. The frozen backbone is loaded in 4-bit
+   (NF4, double-quant) via bitsandbytes -- a plain bf16 7B model already
+   uses ~14GB just sitting there, which doesn't leave enough headroom on a
+   16GB Kaggle GPU for the embedding/LM-head optimizer state once you add
+   gradients on top. 4-bit quantizing the frozen transformer blocks drops
+   that to ~4GB and gives the actually-trainable pieces (LoRA adapters +
+   full embed_tokens/lm_head) the room they need. `lm_head` is explicitly
+   excluded from quantization (`llm_int8_skip_modules`) since it's fully
+   fine-tuned, not just adapted -- you can't backprop a real gradient into
+   a 4-bit-quantized weight.
 
 4. A short continued-pretraining pass (causal LM loss) on the language's
    own corpus, using the extended tokenizer, adapts the model to the new
-   vocabulary.
+   vocabulary. Bounded by a hard wall-clock budget
+   (FINETUNE_MAX_WALL_SECONDS) so it always checkpoints before a Kaggle
+   session gets killed, rather than losing an in-progress run. Re-running
+   the same command resumes from the last checkpoint automatically.
 
 The result is a real, loadable (model, tokenizer) pair that Stage 3 can use
 for a genuine "your tokenizer" condition -- see the LLMCompressor patch in
@@ -52,6 +60,7 @@ stage3_compress.py.
 
 Usage:
     python -m pipeline.stage2d_vocab_extend --lang hindi
+    python -m pipeline.stage2d_vocab_extend --lang hindi --max-hours 4
 """
 
 import argparse
@@ -69,7 +78,8 @@ from pipeline.config import (
     LORA_R, LORA_ALPHA, LORA_DROPOUT, LORA_TARGET_MODULES,
     FINETUNE_BLOCK_SIZE, FINETUNE_BATCH_SIZE, FINETUNE_GRAD_ACCUM_STEPS,
     FINETUNE_LR, FINETUNE_STEPS, FINETUNE_WARMUP_STEPS, FINETUNE_SAVE_EVERY,
-    FINETUNE_LOG_EVERY, FINETUNE_MAX_TRAIN_CHARS, ensure_dirs,
+    FINETUNE_LOG_EVERY, FINETUNE_MAX_TRAIN_CHARS, FINETUNE_MAX_WALL_SECONDS,
+    ensure_dirs,
 )
 from pipeline.devaware_tokenizer import DevAwareTokenizer
 from pipeline.stage2b_devanagari_tokenizer import segment_into_aksharas
@@ -143,7 +153,16 @@ def find_novel_merged_pieces(dev_tok: DevAwareTokenizer, base_tokenizer,
 # ─── Step 3: LoRA wrap + trainable embedding/head ───────────────────────────
 
 def apply_lora_and_unfreeze_embeddings(model):
-    from peft import LoraConfig, get_peft_model, TaskType
+    from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
+
+    # Required before LoRA-wrapping a 4-bit-quantized model: casts norm
+    # layers to fp32 for stability, enables input-grads on the (now
+    # resized) embedding layer, and turns on gradient checkpointing --
+    # which we want anyway given how little headroom is left after the
+    # embed/lm_head optimizer state.
+    model = prepare_model_for_kbit_training(
+        model, use_gradient_checkpointing=True
+    )
 
     lora_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
@@ -190,7 +209,19 @@ class BlockDataset(Dataset):
         return {"input_ids": input_ids, "labels": input_ids.clone()}
 
 
-def finetune(model, tokenizer, train_text: str, device: str, save_dir: Path):
+def finetune(model, tokenizer, train_text: str, device: str, save_dir: Path,
+             start_step: int = 0,
+             max_wall_seconds: float = FINETUNE_MAX_WALL_SECONDS):
+    """
+    `start_step`: resume point (0 for a fresh run, >0 when continuing from
+    a previously-saved step_N checkpoint -- see build_vocab_extended_model).
+
+    `max_wall_seconds`: hard budget for THIS call. Checked every step (not
+    just at log intervals) so a session that's about to be killed still
+    gets a checkpoint written. Hitting the budget is not an error -- it
+    saves and returns early; re-running the same command picks up where
+    this left off.
+    """
     model.train()
     dataset = BlockDataset(train_text, tokenizer, FINETUNE_BLOCK_SIZE)
     print(f"  Fine-tune corpus: {len(train_text):,} chars -> "
@@ -211,12 +242,29 @@ def finetune(model, tokenizer, train_text: str, device: str, save_dir: Path):
         lambda step: min(1.0, step / max(1, FINETUNE_WARMUP_STEPS))
         * max(0.0, (total_steps - step) / max(1, total_steps)),
     )
+    # NOTE: resume re-creates the optimizer/scheduler fresh at start_step
+    # rather than restoring exact Adam momentum -- checkpoints only save
+    # model weights, not optimizer state. That's a stated simplification,
+    # not a hidden one: it costs a brief LR/momentum discontinuity right
+    # after a resume, not correctness.
 
-    step = 0
+    if start_step >= total_steps:
+        print(f"  ✓ {start_step} steps already done (target {total_steps}) -- "
+              f"nothing left to train, finalizing.")
+        _save_checkpoint(model, tokenizer, save_dir, start_step, final=True)
+        model.eval()
+        return model
+
+    step = start_step
     t0 = time.time()
     optimizer.zero_grad()
     data_iter = iter(loader)
+    wall_clock_hit = False
     while step < total_steps:
+        if time.time() - t0 > max_wall_seconds:
+            wall_clock_hit = True
+            break
+
         try:
             batch = next(data_iter)
         except StopIteration:
@@ -243,12 +291,20 @@ def finetune(model, tokenizer, train_text: str, device: str, save_dir: Path):
             print(f"    step {step:5d}/{total_steps}  "
                   f"loss={outputs.loss.item():.4f}  "
                   f"ppl={math.exp(min(outputs.loss.item(), 20)):.2f}  "
-                  f"({elapsed:.0f}s elapsed)", flush=True)
+                  f"({elapsed:.0f}s elapsed / {max_wall_seconds:.0f}s budget)", flush=True)
 
         if step > 0 and step % FINETUNE_SAVE_EVERY == 0:
             _save_checkpoint(model, tokenizer, save_dir, step)
 
         step += 1
+
+    if wall_clock_hit:
+        print(f"  ⏱ Wall-clock budget ({max_wall_seconds:.0f}s) hit at step "
+              f"{step}/{total_steps} -- checkpointing and stopping early. "
+              f"Re-run the exact same command to resume from here.")
+        _save_checkpoint(model, tokenizer, save_dir, step)
+        model.eval()
+        return model
 
     _save_checkpoint(model, tokenizer, save_dir, step, final=True)
     model.eval()
@@ -263,20 +319,104 @@ def _save_checkpoint(model, tokenizer, save_dir: Path, step: int, final: bool = 
     print(f"  ✓ Checkpoint saved: {out_dir}")
 
 
+def _load_quantized_base(device: str):
+    """Load Airavata with the frozen backbone in 4-bit NF4, lm_head kept at
+    full precision since it gets fully fine-tuned (you can't backprop a
+    real gradient into a 4-bit-quantized weight)."""
+    from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=True,
+        llm_int8_skip_modules=["lm_head"],
+    )
+    return AutoModelForCausalLM.from_pretrained(
+        INDIC_LLM_MODEL,
+        trust_remote_code=True,
+        quantization_config=bnb_config,
+        device_map={"": 0} if device == "cuda" else "cpu",
+    )
+
+
+def _find_latest_checkpoint(save_dir: Path):
+    """Return (path, step) of the highest step_N checkpoint under save_dir,
+    or (None, 0) if there isn't one. Deliberately ignores 'final' -- the
+    caller checks that separately, since a 'final' dir means this language
+    is already fully done and shouldn't re-enter the training loop at all."""
+    if not save_dir.exists():
+        return None, 0
+    candidates = []
+    for d in save_dir.iterdir():
+        if d.is_dir() and d.name.startswith("step_"):
+            try:
+                candidates.append((int(d.name.split("_")[1]), d))
+            except (IndexError, ValueError):
+                continue
+    if not candidates:
+        return None, 0
+    candidates.sort(key=lambda x: x[0])
+    step, path = candidates[-1]
+    return path, step
+
+
 # ─── Orchestration ────────────────────────────────────────────────────────
 
-def build_vocab_extended_model(lang: str, device: str = None):
+def build_vocab_extended_model(lang: str, device: str = None,
+                                max_wall_seconds: float = None):
     """
     Full Stage 2d pipeline for one language:
       DevAware SPM -> novel merged pieces -> extend Airavata's tokenizer
-      -> smart-init new embeddings -> LoRA-wrap -> fine-tune -> save.
+      -> smart-init new embeddings -> QLoRA-wrap -> fine-tune -> save.
+
+    Idempotent across calls / Kaggle sessions:
+      - if FINETUNE_DIR/lang/final exists, this language is already done --
+        loads and returns it without touching the GPU for training.
+      - elif FINETUNE_DIR/lang/step_N exists, resumes fine-tuning from the
+        highest N instead of starting over.
+      - else, does the full fresh build (vocab extension + smart init +
+        LoRA-wrap) before fine-tuning.
 
     Returns (model, tokenizer) ready to hand to LLMCompressor.
     """
     from transformers import AutoModelForCausalLM, AutoTokenizer
+    from peft import PeftModel, prepare_model_for_kbit_training
 
     ensure_dirs()
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    max_wall_seconds = (FINETUNE_MAX_WALL_SECONDS if max_wall_seconds is None
+                         else max_wall_seconds)
+
+    save_dir = FINETUNE_DIR / lang
+    final_dir = save_dir / "final"
+
+    if final_dir.exists():
+        print(f"  ✓ Stage 2d already complete for {lang} -- loading "
+              f"{final_dir} (delete it to force a re-run).")
+        tokenizer = AutoTokenizer.from_pretrained(final_dir, trust_remote_code=True)
+        model = _load_quantized_base(device)
+        model.resize_token_embeddings(len(tokenizer))
+        model = PeftModel.from_pretrained(model, final_dir)
+        return model, tokenizer
+
+    resume_dir, resume_step = _find_latest_checkpoint(save_dir)
+
+    if resume_dir is not None:
+        print(f"  ↻ Resuming {lang} fine-tune from {resume_dir} (step {resume_step})")
+        base_tokenizer = AutoTokenizer.from_pretrained(resume_dir, trust_remote_code=True)
+        model = _load_quantized_base(device)
+        model.resize_token_embeddings(len(base_tokenizer))
+        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+        model = PeftModel.from_pretrained(model, resume_dir, is_trainable=True)
+
+        train_file = SPLIT_DIR / lang / "train.txt"
+        with open(train_file, "r", encoding="utf-8") as f:
+            train_text = f.read(FINETUNE_MAX_TRAIN_CHARS)
+
+        model = finetune(model, base_tokenizer, train_text, device, save_dir,
+                          start_step=resume_step, max_wall_seconds=max_wall_seconds)
+        return model, base_tokenizer
 
     tok_dir = TOKENIZER_DIR / lang
     dev_tok = DevAwareTokenizer(
@@ -284,11 +424,9 @@ def build_vocab_extended_model(lang: str, device: str = None):
         pua_map_path=tok_dir / f"akshara_pua_map_{lang}.json",
     )
 
-    print(f"  Loading base tokenizer + model: {INDIC_LLM_MODEL}")
+    print(f"  Loading base tokenizer + model (4-bit): {INDIC_LLM_MODEL}")
     base_tokenizer = AutoTokenizer.from_pretrained(INDIC_LLM_MODEL, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        INDIC_LLM_MODEL, trust_remote_code=True, torch_dtype=torch.bfloat16
-    ).to(device)
+    model = _load_quantized_base(device)
 
     print(f"  Finding novel multi-akshara merges (base vocab size={len(base_tokenizer)})...")
     new_tokens = find_novel_merged_pieces(dev_tok, base_tokenizer)
@@ -341,8 +479,8 @@ def build_vocab_extended_model(lang: str, device: str = None):
     with open(train_file, "r", encoding="utf-8") as f:
         train_text = f.read(FINETUNE_MAX_TRAIN_CHARS)
 
-    save_dir = FINETUNE_DIR / lang
-    model = finetune(model, base_tokenizer, train_text, device, save_dir)
+    model = finetune(model, base_tokenizer, train_text, device, save_dir,
+                      start_step=0, max_wall_seconds=max_wall_seconds)
 
     return model, base_tokenizer
 
@@ -386,15 +524,22 @@ def main():
         description="Stage 2d: extend Airavata's vocab with DevAware merges + LoRA fine-tune"
     )
     parser.add_argument("--lang", choices=LANGUAGES + ["all"], default="all")
+    parser.add_argument(
+        "--max-hours", type=float, default=None,
+        help="Override FINETUNE_MAX_WALL_SECONDS (config.py) for this run, "
+             "in hours. Applies per language, not to the whole --lang all "
+             "batch. Default (config.py) is 3h/language.",
+    )
     args = parser.parse_args()
 
     langs = LANGUAGES if args.lang == "all" else [args.lang]
+    max_wall_seconds = args.max_hours * 3600 if args.max_hours is not None else None
 
     for lang in langs:
         print(f"\n{'='*60}")
         print(f"  STAGE 2d: VOCAB EXTENSION + FINE-TUNE — {lang.upper()}")
         print(f"{'='*60}")
-        build_vocab_extended_model(lang)
+        build_vocab_extended_model(lang, max_wall_seconds=max_wall_seconds)
 
     print("\n✓ Stage 2d (Vocabulary Extension + Fine-tune) complete.")
 
