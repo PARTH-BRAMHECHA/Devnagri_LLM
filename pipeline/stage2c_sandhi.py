@@ -155,29 +155,13 @@ def train_sandhi_variant():
 
     print(f"  Training Sandhi-aware BPE for Sanskrit...")
 
-    from pipeline.stage2b_devanagari_tokenizer import (
-        remap_file, collect_akshara_frequencies, build_symbol_map,
-        _expand_placeholders_in_model, train_spm_safe,
-    )
+    from pipeline.stage2b_devanagari_tokenizer import pre_tokenize_file, train_spm_safe
     from pipeline.config import SENTENCEPIECE_VOCAB_SIZE, SENTENCEPIECE_CHARACTER_COVERAGE
-
-    # Build (or reuse) the same kind of akshara placeholder map used in
-    # stage2b, so this variant gets the same grapheme-cluster protection
-    # without the old "hard space between every akshara" bug.
-    symbol_map_file = tok_dir / "akshara_symbol_map_sandhi.json"
-    if symbol_map_file.exists():
-        with open(symbol_map_file, "r", encoding="utf-8") as f:
-            symbol_map = json.load(f)
-    else:
-        freq = collect_akshara_frequencies(sandhi_train)
-        symbol_map = build_symbol_map(freq)
-        with open(symbol_map_file, "w", encoding="utf-8") as f:
-            json.dump(symbol_map, f, ensure_ascii=False, indent=2)
 
     # Pre-tokenize the sandhi-split text
     pretok_file = tok_dir / "train_sandhi_pretokenized.txt"
     if not pretok_file.exists() or pretok_file.stat().st_size == 0:
-        remap_file(sandhi_train, pretok_file, symbol_map)
+        pre_tokenize_file(sandhi_train, pretok_file)
 
     train_spm_safe(
         input=str(pretok_file),
@@ -188,12 +172,9 @@ def train_sandhi_variant():
         normalization_rule_name="nfkc",
         byte_fallback=True,
         split_digits=True,
-        split_by_unicode_script=False,
         num_threads=os.cpu_count() or 4,
         max_sentence_length=16384,
     )
-
-    _expand_placeholders_in_model(model_file, symbol_map)
 
     print(f"  ✓ Sandhi-aware model saved: {model_file}")
     return str(model_file)

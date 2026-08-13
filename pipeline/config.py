@@ -93,6 +93,45 @@ BASELINE_TOKENIZERS = [
     "ai4bharat/IndicBERTv2-MLM-only",
 ]
 
+# ─── Stage 2d: Vocabulary Extension + LoRA Fine-tune ────────────────────────
+# This is the "your tokenizer" condition for Stage 3c: extends the LLM's
+# native vocabulary with the DevAware tokenizer's genuinely novel
+# multi-akshara merged tokens, smart-initializes their embeddings, and
+# LoRA-fine-tunes the model so those new tokens produce meaningful
+# probabilities. See pipeline/stage2d_vocab_extend.py.
+FINETUNE_DIR = MODEL_DIR / "devaware_finetuned"
+
+# Only add merged pieces spanning at least this many aksharas -- single
+# aksharas that already round-trip through the base tokenizer add no value.
+VOCAB_EXTEND_MIN_AKSHARAS = 2
+# Cap on how many new tokens get added per language (bounds embedding growth
+# and fine-tune cost; ranked by akshara-span length, longest merges first).
+VOCAB_EXTEND_MAX_NEW_TOKENS = 4000
+
+# LoRA hyperparameters for the transformer blocks (embed_tokens / lm_head are
+# fine-tuned in full, separately -- see stage2d for why).
+LORA_R = 16
+LORA_ALPHA = 32
+LORA_DROPOUT = 0.05
+LORA_TARGET_MODULES = [
+    "q_proj", "k_proj", "v_proj", "o_proj",
+    "gate_proj", "up_proj", "down_proj",
+]
+
+# Continued-pretraining hyperparameters
+FINETUNE_BLOCK_SIZE = 512
+FINETUNE_BATCH_SIZE = 2
+FINETUNE_GRAD_ACCUM_STEPS = 8
+FINETUNE_LR = 2e-4
+FINETUNE_STEPS = 1000
+FINETUNE_WARMUP_STEPS = 50
+FINETUNE_SAVE_EVERY = 200
+FINETUNE_LOG_EVERY = 20
+# Cap how much of train.txt gets used -- this is a Kaggle-session-budget
+# knob, not a methodology choice; state whatever value you actually use in
+# the paper's methodology section.
+FINETUNE_MAX_TRAIN_CHARS = 20_000_000
+
 # ─── Logging ─────────────────────────────────────────────────────────────────
 LOG_LEVEL = "INFO"
 LOG_FILE = LOGS_DIR / "pipeline.log"
@@ -101,10 +140,11 @@ LOG_FILE = LOGS_DIR / "pipeline.log"
 def ensure_dirs():
     """Create all required directories."""
     for d in [CLEAN_DIR, SPLIT_DIR, TOKENIZER_DIR, MODEL_DIR,
-              RESULTS_DIR, LOGS_DIR, EVAL_DIR]:
+              RESULTS_DIR, LOGS_DIR, EVAL_DIR, FINETUNE_DIR]:
         d.mkdir(parents=True, exist_ok=True)
     for lang in LANGUAGES:
         (CLEAN_DIR / lang).mkdir(parents=True, exist_ok=True)
         (SPLIT_DIR / lang).mkdir(parents=True, exist_ok=True)
         (TOKENIZER_DIR / lang).mkdir(parents=True, exist_ok=True)
         (RESULTS_DIR / lang).mkdir(parents=True, exist_ok=True)
+        (FINETUNE_DIR / lang).mkdir(parents=True, exist_ok=True)

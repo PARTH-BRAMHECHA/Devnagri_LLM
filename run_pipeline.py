@@ -91,8 +91,46 @@ def run_stage_2(lang: str = "all"):
         print("  (Skipped — sandhi module is Sanskrit-only)")
 
 
-def run_stage_3(lang: str = "all", classical_only: bool = False):
-    """Stage 3: Compression Pipeline"""
+def run_stage_2d(lang: str = "all"):
+    """Stage 2d: Vocabulary Extension + LoRA Fine-tune (optional, expensive).
+
+    Not part of `--stage all` by default -- this trains an adapter per
+    language and takes real GPU time. Run it explicitly:
+        python run_pipeline.py --stage 2d --lang hindi
+    then pass --use-devaware-tokenizer to Stage 3 to actually use the
+    result for the "your tokenizer" compression condition.
+    """
+    from pipeline.stage2d_vocab_extend import build_vocab_extended_model
+
+    langs = LANGUAGES if lang == "all" else [lang]
+
+    print("\n" + "=" * 70)
+    print("  STAGE 2d: VOCABULARY EXTENSION + FINE-TUNE")
+    print("=" * 70)
+    for l in langs:
+        build_vocab_extended_model(l)
+
+
+def run_stage_3(lang: str = "all", classical_only: bool = False, verify: bool = False,
+                 use_devaware_tokenizer: bool = False):
+    """Stage 3: Compression Pipeline
+
+    NOTE: `verify` defaults to False. Round-trip verification calls
+    LLMCompressor.compress() *and* .decompress() on top of the normal
+    compute_bpc() pass -- effectively 3x the model forward passes -- and
+    on a 7B model with no KV reuse in the old code, this is what turned
+    a Kaggle run into an 8+ hour hang stuck at "3/252 tokens". It's a
+    one-time correctness check, not something that needs to run on every
+    language on every pipeline run. Pass --verify explicitly (or
+    verify=True here) to opt back in.
+
+    `use_devaware_tokenizer`: if True, also loads each language's Stage 2d
+    checkpoint (must already exist -- run `--stage 2d` first) and reports
+    a genuine "your tokenizer" compression condition alongside the model
+    default. If a language has no Stage 2d checkpoint yet, that language
+    falls back to the two-condition table with a printed warning, rather
+    than failing the whole run.
+    """
     from pipeline.stage3_compress import run_compression, LLMCompressor
     from pipeline.config import INDIC_LLM_MODEL
 
@@ -100,6 +138,10 @@ def run_stage_3(lang: str = "all", classical_only: bool = False):
 
     print("\n" + "=" * 70)
     print("  STAGE 3: COMPRESSION PIPELINE")
+    if verify:
+        print("  (round-trip verification ENABLED — this triples model calls)")
+    if use_devaware_tokenizer:
+        print("  (DevAware tokenizer condition ENABLED — requires Stage 2d checkpoints)")
     print("=" * 70)
 
     # Load the LLM once and reuse it across every language instead of
@@ -110,10 +152,32 @@ def run_stage_3(lang: str = "all", classical_only: bool = False):
         shared_compressor = LLMCompressor(INDIC_LLM_MODEL)
 
     for l in langs:
-        run_compression(l, verify=True, classical_only=classical_only,
-                         compressor=shared_compressor)
+        devaware_compressor = None
+        if use_devaware_tokenizer and not classical_only:
+            devaware_compressor = _load_devaware_compressor(l)
+        run_compression(l, verify=verify, classical_only=classical_only,
+                         compressor=shared_compressor,
+                         devaware_compressor=devaware_compressor)
 
     return shared_compressor
+
+
+def _load_devaware_compressor(lang: str):
+    """Load Stage 2d's fine-tuned model for `lang` and wrap it in an
+    LLMCompressor, or return None (with a warning) if it isn't available."""
+    from pipeline.stage2d_vocab_extend import load_finetuned_devaware_model
+    from pipeline.stage3_compress import LLMCompressor
+    from pipeline.config import INDIC_LLM_MODEL
+
+    try:
+        model, tokenizer = load_finetuned_devaware_model(lang)
+    except FileNotFoundError as e:
+        print(f"  ⚠ {e}")
+        print(f"  ⚠ Skipping 'your tokenizer' condition for {lang} "
+              f"(falling back to model-default / classical only).")
+        return None
+
+    return LLMCompressor(INDIC_LLM_MODEL, tokenizer=tokenizer, model=model)
 
 
 def run_stage_4(lang: str = "all", classical_only: bool = False, compressor=None):
@@ -175,9 +239,12 @@ Examples:
     )
     parser.add_argument(
         "--stage",
-        choices=["1", "2", "3", "4", "5", "all"],
+        choices=["1", "2", "2d", "3", "4", "5", "all"],
         default="all",
-        help="Pipeline stage to run (default: all)",
+        help="Pipeline stage to run (default: all). '2d' (vocab extension + "
+             "fine-tune) is NOT included in 'all' -- it's expensive and "
+             "opt-in; run it explicitly, then pass --use-devaware-tokenizer "
+             "to Stage 3.",
     )
     parser.add_argument(
         "--lang",
@@ -189,6 +256,20 @@ Examples:
         "--classical-only",
         action="store_true",
         help="Skip LLM-based compression (use only classical compressors)",
+    )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="Run lossless round-trip verification in Stage 3 (compress+decompress "
+             "on top of the normal BPC pass, ~3x model calls). Off by default -- "
+             "this is what caused the multi-hour Kaggle hang.",
+    )
+    parser.add_argument(
+        "--use-devaware-tokenizer",
+        action="store_true",
+        help="In Stage 3, also report the 'your tokenizer' compression condition "
+             "using Stage 2d's vocab-extended, fine-tuned model. Requires "
+             "`--stage 2d` to have been run for the target language(s) first.",
     )
     args = parser.parse_args()
 
@@ -208,8 +289,13 @@ Examples:
             run_stage_1(args.lang)
         elif stage == "2":
             run_stage_2(args.lang)
+        elif stage == "2d":
+            run_stage_2d(args.lang)
         elif stage == "3":
-            llm_compressor = run_stage_3(args.lang, args.classical_only)
+            llm_compressor = run_stage_3(
+                args.lang, args.classical_only, args.verify,
+                use_devaware_tokenizer=args.use_devaware_tokenizer,
+            )
         elif stage == "4":
             run_stage_4(args.lang, args.classical_only, compressor=llm_compressor)
         elif stage == "5":

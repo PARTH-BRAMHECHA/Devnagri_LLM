@@ -4,6 +4,7 @@ torchvision
 torchaudio
 transformers
 accelerate
+peft
 
 # Tokenization
 sentencepiece

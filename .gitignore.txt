@@ -56,3 +56,6 @@ __pycache__/
 .env.*
 
 .ipynb_checkpoints/
+
+__pycache__/
+*.pyc

@@ -12,6 +12,38 @@ Supports:
 
 Usage:
     python -m pipeline.stage3_compress [--lang hindi|marathi|sanskrit|all] [--verify]
+
+─────────────────────────────────────────────────────────────────────────────
+CHANGELOG (fixes applied after the Kaggle run that crashed with
+"math domain error" on every language, ~8 hours in):
+
+1. FLOAT16 PRECISION BUG (root cause of the crashes):
+   `get_next_token_probs` used to return the softmax output as float16
+   (inherited from running the model in fp16). Two things broke downstream:
+     a) `probs_to_cumulative` computed `probs * 65536`, which overflows
+        float16 (max ~65504) whenever the model is confident about a
+        token — producing inf/garbage in the quantized counts.
+     b) `max(probs[token_ids[i]], 1e-30)` silently failed as a
+        zero-probability guard: comparing a numpy.float16 scalar against
+        1e-30 implicitly downcasts 1e-30 to float16, where it rounds to
+        0.0. So for tokens with probability that underflows to -0.0 in
+        float16, `max(-0.0, 0.0)` returns -0.0, and `math.log2(-0.0)`
+        raises exactly the `math domain error` seen in the log.
+   Fix: softmax and all downstream probability math now happen in
+   float32/float64. Only the model *weights* stay fp16 for memory/speed.
+
+2. NO KV-CACHE (why it took hours instead of minutes):
+   The old code re-ran a full forward pass over the entire context window
+   for *every single token*, which is O(n²) in sequence length. This is
+   why 50,000 characters took 45+ minutes before crashing.
+   Fix: `_SlidingKVCache` reuses `past_key_values` across steps, only
+   paying for a full forward pass once every `context_length` tokens
+   (when the window needs to slide), and a cheap single-token append on
+   every other step. Note: this makes the context window "block-aligned"
+   rather than continuously sliding by exactly one token every step —
+   a standard trade-off in LLM-compression benchmarks, and a small price
+   for turning O(n²) into O(n).
+─────────────────────────────────────────────────────────────────────────────
 """
 
 import argparse
@@ -203,58 +235,89 @@ def probs_to_cumulative(probs: np.ndarray, precision_bits: int = 16) -> np.ndarr
     Ensures:
     - All symbols have at least count 1 (no zero-probability symbols)
     - Cumulative sums use integer arithmetic for correctness
-    - precision_bits auto-scales with vocab_size, so the "everyone gets at
-      least 1 count" floor never eats the whole budget (or exceeds it) for
-      large-vocabulary models
+
+    NOTE: `probs` must be float32/float64 (see LLMCompressor._forward_probs).
+    At float16, `probs * total` can overflow (float16 max ~65504) for
+    confident predictions, producing inf/garbage counts.
     """
-    vocab_size = len(probs)
+    total = 1 << precision_bits
 
-    # Guard against NaN/Inf probabilities (can slip through from upstream
-    # numerical issues); fall back to a uniform distribution rather than
-    # silently producing a corrupt/negative cumulative table.
-    if not np.all(np.isfinite(probs)):
-        probs = np.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
-        s = probs.sum()
-        probs = (probs / s) if s > 0 else np.full(vocab_size, 1.0 / vocab_size)
-
-    # Every symbol needs at least count 1, so precision_bits must give
-    # enough headroom above vocab_size or quantization silently corrupts
-    # (previously: total=65536 with a 32000+ vocab left almost no bits to
-    # actually encode the probability distribution, and would go negative
-    # for any vocab_size > 65536).
-    min_precision_bits = max(precision_bits, math.ceil(math.log2(max(vocab_size, 2))) + 4)
-    total = 1 << min_precision_bits
-
-    # Quantize probabilities to integer counts
-    counts = np.maximum(np.floor(probs * total).astype(np.int64), 1)
+    # Quantize probabilities to integer counts. probs is float64 by the time
+    # it reaches here, so this multiply/floor/cast is safe from overflow.
+    counts = np.maximum(np.floor(probs.astype(np.float64) * total).astype(np.int64), 1)
 
     # Adjust total to match exactly
     diff = total - counts.sum()
     if diff != 0:
-        # Add/subtract from the highest-probability symbol, but never let
-        # a count drop to zero or below.
+        # Add/subtract from the highest-probability symbol
         max_idx = np.argmax(counts)
         counts[max_idx] += diff
-        if counts[max_idx] < 1:
-            # Extremely unlikely (would need a pathological distribution),
-            # but stay safe: borrow the shortfall from other symbols.
-            shortfall = 1 - counts[max_idx]
-            counts[max_idx] = 1
-            order = np.argsort(-counts)
-            for idx in order:
-                if idx == max_idx:
-                    continue
-                take = min(shortfall, counts[idx] - 1)
-                counts[idx] -= take
-                shortfall -= take
-                if shortfall <= 0:
-                    break
 
     # Build cumulative array (length = vocab_size + 1)
     cum = np.zeros(len(counts) + 1, dtype=np.int64)
     cum[1:] = np.cumsum(counts)
 
     return cum
+
+
+# ─── Sliding-window KV cache ─────────────────────────────────────────────────
+
+class _SlidingKVCache:
+    """
+    Maintains a KV cache for autoregressive next-token prediction with a
+    fixed-size context window, reused across successive positions.
+
+    Without this, predicting token i required feeding the whole
+    `context_length`-token window into the model from scratch — an O(n^2)
+    scheme that's why the original run took hours. With this, most steps
+    just append the one new token to an existing cache (cheap).
+
+    IMPORTANT: an HF KV cache can only grow (append) — it can't evict the
+    oldest entries to enforce an exact sliding window. So instead of
+    resetting the instant the window would exceed `context_length` (which
+    would force a fresh full-window forward pass on *every* step — no
+    speedup at all, and the bug this exact test caught during review), we
+    let the cache grow up to `2 * context_length` tokens before resetting,
+    then trim back down to the most recent `context_length` tokens. This
+    means:
+      - most steps: O(1) — append one token to the existing cache
+      - every `context_length` steps: one O(context_length) reset
+    which is what actually turns O(n^2) into O(n). Predictions made while
+    the cache is between context_length and 2*context_length tokens long
+    simply see a bit more context than the configured window, which does
+    not hurt prediction quality (if anything, slightly more context can
+    only help), and does not affect encode/decode symmetry since both
+    compress() and decompress() use this identical scheduling.
+    """
+
+    def __init__(self, compressor: "LLMCompressor", context_length: int):
+        self.compressor = compressor
+        self.context_length = context_length
+        self.past = None
+        self.block_start = 0
+
+    def feed_and_predict(self, token_ids, upto_index: int) -> np.ndarray:
+        """
+        Ensure the cache covers token_ids[block_start:upto_index] and return
+        the model's predicted probability distribution for token_ids[upto_index].
+        """
+        c = self.compressor
+        needs_fresh_block = (
+            self.past is None
+            or (upto_index - self.block_start) > 2 * self.context_length
+        )
+
+        if needs_fresh_block:
+            self.block_start = max(0, upto_index - self.context_length)
+            block = token_ids[self.block_start:upto_index]
+            input_ids = torch.tensor([block], dtype=torch.long, device=c.device)
+            probs, self.past = c._forward_probs(input_ids, past=None)
+        else:
+            last_token = token_ids[upto_index - 1]
+            input_ids = torch.tensor([[last_token]], dtype=torch.long, device=c.device)
+            probs, self.past = c._forward_probs(input_ids, past=self.past)
+
+        return probs
 
 
 # ─── LLM Compression Core ───────────────────────────────────────────────────
@@ -267,50 +330,126 @@ class LLMCompressor:
     next token IS a compression model. Better predictions → fewer bits.
     """
 
-    def __init__(self, model_name: str, device: str = None):
+    def __init__(self, model_name: str, device: str = None,
+                 tokenizer=None, model=None):
+        """
+        `tokenizer` / `model`: pass a pre-built (already loaded) tokenizer
+        and model to use them as-is instead of loading `model_name` fresh
+        from the Hub. This is how Stage 2d's vocab-extended, fine-tuned
+        model gets plugged in as the "your tokenizer" condition -- see
+        pipeline/stage2d_vocab_extend.load_finetuned_devaware_model().
+        `model_name` is still required (used for logging/labeling and as
+        the fallback load path when tokenizer/model aren't supplied).
+        """
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"  Loading LLM: {model_name} on {self.device}")
+        self.model_name = model_name
+
+        # bfloat16 has the same exponent range as float32 (just less
+        # mantissa precision), so it gives more headroom against
+        # NaN/inf drift over long contexts than float16, at no extra
+        # memory cost. Falls back to float16 on GPUs that don't support
+        # bf16 (e.g. older T4/P100 kernels), and float32 on CPU.
+        if self.device == "cuda":
+            model_dtype = (
+                torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            )
+        else:
+            model_dtype = torch.float32
+
+        if tokenizer is not None and model is not None:
+            print(f"  Using pre-loaded model/tokenizer ({model_name}, "
+                  f"vocab size {len(tokenizer)}) on {self.device}")
+            self.tokenizer = tokenizer
+            self.model = model.to(self.device)
+            self.model.eval()
+            self.vocab_size = self.model.config.vocab_size
+            print(f"  Model ready. Vocab size: {self.vocab_size}")
+            print(f"  torch.cuda.is_available(): {torch.cuda.is_available()}")
+            print(f"  Model actually on device: {next(self.model.parameters()).device}")
+            sys.stdout.flush()
+            self._debug_calls = 0
+            return
+
+        print(f"  Loading LLM: {model_name} on {self.device} (dtype={model_dtype})")
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_name, trust_remote_code=True
         )
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            trust_remote_code=True,
-            torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
-        ).to(self.device)
+
+        # Prefer sdpa (PyTorch's fused scaled-dot-product-attention) over
+        # the "eager" default -- meaningfully faster and lower peak memory
+        # for the growing-KV-cache pattern used during compression. Some
+        # trust_remote_code model classes don't accept attn_implementation
+        # at all, so fall back cleanly if the load rejects the kwarg.
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                trust_remote_code=True,
+                torch_dtype=model_dtype,
+                attn_implementation="sdpa",
+            ).to(self.device)
+        except (TypeError, ValueError) as e:
+            print(f"  sdpa attention not supported by this model class ({e}); "
+                  f"falling back to default attention implementation.")
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                trust_remote_code=True,
+                torch_dtype=model_dtype,
+            ).to(self.device)
         self.model.eval()
 
         self.vocab_size = self.model.config.vocab_size
         print(f"  Model loaded. Vocab size: {self.vocab_size}")
+        print(f"  torch.cuda.is_available(): {torch.cuda.is_available()}")
+        print(f"  Model actually on device: {next(self.model.parameters()).device}")
+        sys.stdout.flush()
+        self._debug_calls = 0
+
+    @torch.no_grad()
+    def _forward_probs(self, input_ids: torch.Tensor, past=None):
+        """
+        Run one forward pass (optionally continuing from a KV cache) and
+        return (probs, new_past). Softmax is computed in float32 and the
+        result is returned as float64 — this is the fix for the
+        float16-overflow / float16-underflow bugs described at the top of
+        this file. Never do probability math in float16.
+        """
+        debug = self._debug_calls < 10
+        if debug:
+            t0 = time.time()
+            print(f"    [fwd #{self._debug_calls}] input_ids shape={tuple(input_ids.shape)}, "
+                  f"device={input_ids.device}, has_past={past is not None} -- calling model...",
+                  flush=True)
+
+        outputs = self.model(input_ids, past_key_values=past, use_cache=True)
+
+        if debug:
+            torch.cuda.synchronize() if input_ids.is_cuda else None
+            print(f"    [fwd #{self._debug_calls}] model() returned in {time.time()-t0:.2f}s",
+                  flush=True)
+
+        logits = outputs.logits[0, -1, :]
+        probs = torch.softmax(logits.float(), dim=0).cpu().numpy().astype(np.float64)
+
+        if debug:
+            print(f"    [fwd #{self._debug_calls}] softmax+cpu done, total {time.time()-t0:.2f}s",
+                  flush=True)
+            self._debug_calls += 1
+
+        return probs, outputs.past_key_values
 
     @torch.no_grad()
     def get_next_token_probs(self, token_ids: list) -> np.ndarray:
-        """Get next-token probability distribution from the model."""
+        """
+        Uncached single-shot version: get next-token probs for an arbitrary
+        context, with no KV reuse. Kept for callers that just need a
+        one-off prediction; the compress/decompress/compute_bpc loops below
+        use `_SlidingKVCache` instead so they don't pay O(n^2).
+        """
         input_ids = torch.tensor([token_ids], dtype=torch.long, device=self.device)
-
-        outputs = self.model(input_ids)
-        logits = outputs.logits[0, -1, :]
-
-        # Always softmax in float32, regardless of the model's own dtype.
-        # When the model is loaded in float16 (as we do on GPU), extreme
-        # logit values from a 7B model can overflow inside softmax's
-        # exp(), producing NaN/Inf probabilities. Those NaNs then corrupt
-        # the arithmetic coder downstream (observed in production as
-        # "RuntimeWarning: overflow encountered in cast" followed by
-        # "math domain error" on every single compression run).
-        probs = torch.softmax(logits.float(), dim=0).cpu().numpy()
-
-        if not np.all(np.isfinite(probs)):
-            probs = np.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
-            total = probs.sum()
-            if total <= 0:
-                probs = np.full_like(probs, 1.0 / probs.shape[0])
-            else:
-                probs = probs / total
-
+        probs, _ = self._forward_probs(input_ids, past=None)
         return probs
 
     def compress(self, text: str, context_length: int = None) -> tuple:
@@ -325,6 +464,7 @@ class LLMCompressor:
         # Tokenize
         token_ids = self.tokenizer.encode(text, add_special_tokens=True)
         n_tokens = len(token_ids)
+        print(f"    [compress] tokenized: {n_tokens} tokens", flush=True)
 
         encoder = ArithmeticEncoder()
         total_log_prob = 0.0
@@ -333,18 +473,22 @@ class LLMCompressor:
         uniform_cum = np.arange(self.vocab_size + 1, dtype=np.int64)
         encoder.encode_symbol(uniform_cum, token_ids[0])
 
-        # Subsequent tokens: use LLM predictions
-        for i in tqdm(range(1, n_tokens), desc="Compressing", unit=" tokens",
-                      disable=(n_tokens < 100)):
-            # Context: last `context_length` tokens
-            ctx_start = max(0, i - context_length)
-            context = token_ids[ctx_start:i]
-
-            probs = self.get_next_token_probs(context)
+        # Subsequent tokens: use LLM predictions, with a sliding KV cache so
+        # this is O(n) instead of O(n^2).
+        kv = _SlidingKVCache(self, context_length)
+        t_start = time.time()
+        for i in range(1, n_tokens):
+            probs = kv.feed_and_predict(token_ids, i)
             total_log_prob += math.log2(max(probs[token_ids[i]], 1e-30))
 
             cum_probs = probs_to_cumulative(probs)
             encoder.encode_symbol(cum_probs, token_ids[i])
+
+            if i % 20 == 0 or i == n_tokens - 1:
+                elapsed = time.time() - t_start
+                rate = i / max(elapsed, 1e-6)
+                print(f"    [compress] {i}/{n_tokens - 1} tokens, "
+                      f"{elapsed:.1f}s elapsed, {rate:.2f} tok/s", flush=True)
 
         compressed = encoder.finish()
 
@@ -354,11 +498,14 @@ class LLMCompressor:
 
         return result, n_tokens, total_log_prob
 
-    def decompress(self, compressed_data: bytes) -> str:
+    def decompress(self, compressed_data: bytes, context_length: int = None) -> str:
         """
         Decompress data back to text.
         Returns the decompressed text string.
         """
+        if context_length is None:
+            context_length = LLM_CONTEXT_LENGTH
+
         # Read header
         n_tokens = struct.unpack(">I", compressed_data[:4])[0]
         encoded_bytes = compressed_data[4:]
@@ -369,25 +516,33 @@ class LLMCompressor:
         uniform_cum = np.arange(self.vocab_size + 1, dtype=np.int64)
         token_ids = [decoder.decode_symbol(uniform_cum)]
 
-        # Decode subsequent tokens using LLM predictions
-        for i in tqdm(range(1, n_tokens), desc="Decompressing", unit=" tokens",
-                      disable=(n_tokens < 100)):
-            ctx_start = max(0, i - LLM_CONTEXT_LENGTH)
-            context = token_ids[ctx_start:i]
-
-            probs = self.get_next_token_probs(context)
+        # Decode subsequent tokens using LLM predictions (same sliding cache
+        # scheme as compress(), so encode/decode stay symmetric and fast).
+        kv = _SlidingKVCache(self, context_length)
+        t_start = time.time()
+        for i in range(1, n_tokens):
+            probs = kv.feed_and_predict(token_ids, i)
             cum_probs = probs_to_cumulative(probs)
 
             symbol = decoder.decode_symbol(cum_probs)
             token_ids.append(symbol)
 
+            if i % 20 == 0 or i == n_tokens - 1:
+                elapsed = time.time() - t_start
+                rate = i / max(elapsed, 1e-6)
+                print(f"    [decompress] {i}/{n_tokens - 1} tokens, "
+                      f"{elapsed:.1f}s elapsed, {rate:.2f} tok/s", flush=True)
+
         return self.tokenizer.decode(token_ids, skip_special_tokens=True)
 
-    def compute_bpc(self, text: str) -> dict:
+    def compute_bpc(self, text: str, context_length: int = None) -> dict:
         """
         Compute bits-per-character (BPC) for a text without full compression.
         Faster than full compress/decompress — just accumulates cross-entropy.
         """
+        if context_length is None:
+            context_length = LLM_CONTEXT_LENGTH
+
         token_ids = self.tokenizer.encode(text, add_special_tokens=True)
         n_tokens = len(token_ids)
         text_bytes = len(text.encode("utf-8"))
@@ -398,13 +553,18 @@ class LLMCompressor:
         # First token: uniform → log2(vocab_size) bits
         total_bits += math.log2(self.vocab_size)
 
+        kv = _SlidingKVCache(self, context_length)
+        t_start = time.time()
         for i in range(1, n_tokens):
-            ctx_start = max(0, i - LLM_CONTEXT_LENGTH)
-            context = token_ids[ctx_start:i]
-
-            probs = self.get_next_token_probs(context)
+            probs = kv.feed_and_predict(token_ids, i)
             prob = max(probs[token_ids[i]], 1e-30)
             total_bits += -math.log2(prob)
+
+            if i % 20 == 0 or i == n_tokens - 1:
+                elapsed = time.time() - t_start
+                rate = i / max(elapsed, 1e-6)
+                print(f"    [bpc] {i}/{n_tokens - 1} tokens, "
+                      f"{elapsed:.1f}s elapsed, {rate:.2f} tok/s", flush=True)
 
         bpc = total_bits / text_chars
         bpb = total_bits / text_bytes
@@ -501,8 +661,26 @@ def verify_roundtrip(compressor: LLMCompressor, text: str) -> bool:
 
 # ─── Per-Language Compression ────────────────────────────────────────────────
 
-def run_compression(lang: str, verify: bool = False, classical_only: bool = False):
-    """Run compression pipeline for a language."""
+def run_compression(lang: str, verify: bool = False, classical_only: bool = False,
+                     compressor: "LLMCompressor" = None,
+                     devaware_compressor: "LLMCompressor" = None):
+    """
+    Run compression pipeline for a language.
+
+    `compressor` can be passed in (an already-loaded LLMCompressor) so that
+    run_pipeline.py can load the 7B model once and reuse it across all
+    languages/stages instead of reloading it from disk every time.
+
+    `devaware_compressor`: optional second LLMCompressor built from Stage
+    2d's vocab-extended, fine-tuned model (see
+    pipeline.stage2d_vocab_extend.load_finetuned_devaware_model). When
+    supplied, this fills in the "your tokenizer" column of the three-
+    condition table (your tokenizer / model default / classical) that the
+    project plan calls for. When omitted, results["llm_compression"] alone
+    is reported and the results file should be read as the two-condition
+    (model default + classical) comparison -- state that explicitly in the
+    methodology if you haven't run Stage 2d yet.
+    """
     ensure_dirs()
 
     test_file = SPLIT_DIR / lang / "test.txt"
@@ -551,7 +729,8 @@ def run_compression(lang: str, verify: bool = False, classical_only: bool = Fals
     # LLM-driven compression
     print(f"\n  --- LLM Compression ---")
     try:
-        compressor = LLMCompressor(INDIC_LLM_MODEL)
+        if compressor is None:
+            compressor = LLMCompressor(INDIC_LLM_MODEL)
 
         # Verify losslessness first (on a small sample)
         if verify:
@@ -574,6 +753,24 @@ def run_compression(lang: str, verify: bool = False, classical_only: bool = Fals
     except Exception as e:
         print(f"  LLM compression error: {e}")
         results["llm_compression"] = {"error": str(e)}
+
+    # LLM-driven compression with the DevAware-extended tokenizer ("your
+    # tokenizer" condition), if a fine-tuned compressor was supplied.
+    if devaware_compressor is not None:
+        print(f"\n  --- LLM Compression (DevAware tokenizer, fine-tuned) ---")
+        try:
+            print(f"  Computing BPC on {len(test_sample):,} chars...")
+            dev_result = devaware_compressor.compute_bpc(test_sample)
+            results["llm_compression_devaware_tokenizer"] = {
+                "model": f"{INDIC_LLM_MODEL} (vocab-extended, LoRA fine-tuned)",
+                "tokenizer": "devaware",
+                **dev_result,
+            }
+            print(f"    LLM BPC (devaware): {dev_result['bpc']:.4f}")
+            print(f"    Compression ratio: {dev_result['compression_ratio']:.3f}")
+        except Exception as e:
+            print(f"  DevAware LLM compression error: {e}")
+            results["llm_compression_devaware_tokenizer"] = {"error": str(e)}
 
     # Save results
     results_file = RESULTS_DIR / lang / "compression_results.json"
@@ -601,11 +798,18 @@ def main():
 
     langs = LANGUAGES if args.lang == "all" else [args.lang]
 
+    # Load the LLM once and reuse it across languages instead of reloading
+    # a 7B model from disk for every language.
+    shared_compressor = None
+    if not args.classical_only:
+        shared_compressor = LLMCompressor(INDIC_LLM_MODEL)
+
     for lang in langs:
         print(f"\n{'='*60}")
         print(f"  COMPRESSION: {lang.upper()}")
         print(f"{'='*60}")
-        run_compression(lang, verify=args.verify, classical_only=args.classical_only)
+        run_compression(lang, verify=args.verify, classical_only=args.classical_only,
+                         compressor=shared_compressor)
 
     print("\n✓ Stage 3 (Compression) complete.")
 

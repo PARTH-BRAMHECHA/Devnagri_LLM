@@ -7,36 +7,20 @@ consonant+matra+virama as a single pre-tokenization unit.
 This is the core innovation: instead of letting BPE split across
 grapheme cluster boundaries, we protect aksharas (orthographic syllables)
 as atomic units during the pre-tokenization step -- while still letting
-BPE freely *merge multiple whole aksharas* into a single token, exactly
-like it merges plain characters in an ordinary corpus.
+BPE merge multiple adjacent aksharas into a single subword unit, which is
+the whole point of training a custom tokenizer instead of just using
+character-level splitting.
 
-How protection works
----------------------
-Every multi-codepoint akshara (e.g. a consonant+matra or a conjunct such
-as क्ष) that appears in the training corpus is temporarily replaced by a
-single placeholder character drawn from the Unicode Private Use Area
-(U+E000-U+F8FF) before SentencePiece ever sees the text. Because each
-placeholder is a single, indivisible "character", SentencePiece BPE can
-never split *inside* an akshara, but it is completely free to merge a
-placeholder with its neighbours -- exactly the behaviour we want.
-
-After training, the placeholders are expanded back to their original
-grapheme strings directly inside the trained `.model` file (see
-`_expand_placeholders_in_model`), so the final model works exactly like
-any other SentencePiece model: it can be loaded with
-`spm.SentencePieceProcessor().Load(...)` and called on raw, un-modified
-text everywhere else in the pipeline (stage2c, eval_utils, stage3, ...).
-
-NOTE ON A PREVIOUS BUG
------------------------
-An earlier version of this module joined akshara segments with literal
-space characters before training. SentencePiece treats whitespace as a
-hard word boundary (no BPE merge is ever allowed to cross it), so that
-approach accidentally prevented the tokenizer from ever combining more
-than one akshara into a token -- it degenerated into (worse than)
-character-level tokenization and used *more* tokens per sentence than
-the plain baseline BPE, not fewer. The placeholder-symbol approach above
-fixes this while still guaranteeing grapheme-cluster protection.
+FIX (see pipeline/pua_remap.py for the full rationale): aksharas are no
+longer joined with literal spaces before SentencePiece training. Spaces
+were being treated as hard token boundaries by SentencePiece's
+split_by_whitespace=True, which prevented BPE from ever merging two
+aksharas together -- even within the same word -- and made the
+Devanagari-aware tokenizer strictly worse than the plain baseline BPE
+(0.502 vs 0.254 tokens/char). Each distinct akshara is now collapsed to a
+single Private-Use-Area code point instead, so it stays atomic (can't be
+split internally) but can still be merged with its neighbors by BPE. Real
+word-boundary spaces are left untouched.
 
 Usage:
     python -m pipeline.stage2b_devanagari_tokenizer [--lang hindi|marathi|sanskrit|all]
@@ -47,7 +31,6 @@ import json
 import os
 import re
 import sys
-from collections import Counter
 from pathlib import Path
 
 import regex
@@ -59,6 +42,7 @@ from pipeline.config import (
     SENTENCEPIECE_VOCAB_SIZE, SENTENCEPIECE_CHARACTER_COVERAGE,
     ensure_dirs
 )
+from pipeline.pua_remap import AksharaPUAMap
 
 
 # ─── Devanagari Unicode Constants ────────────────────────────────────────────
@@ -96,22 +80,20 @@ VOWEL_PATTERN = regex.compile(r"[\u0904-\u0914][\u0901-\u0903]?")
 # Full grapheme cluster (Unicode standard)
 GRAPHEME_CLUSTER = regex.compile(r"\X")
 
-# ─── Placeholder symbols used to protect multi-codepoint aksharas ──────────
-# Private Use Area: guaranteed not to collide with any real corpus text.
-PUA_START = 0xE000
-PUA_END = 0xF8FF
-PUA_BUDGET = PUA_END - PUA_START + 1  # 6,400 placeholder codepoints
+# Internal marker used during segmentation to stand for a real space, before
+# it gets converted to a literal " " by the PUA remap step.
+SPACE_MARKER = "▁"
 
 
 def segment_into_aksharas(text: str) -> list:
     """
     Segment Devanagari text into aksharas (orthographic syllables).
 
+    This protects grapheme clusters from being split by BPE:
     - Consonant + virama + consonant sequences stay together
     - Consonant + matra stays together
     - Independent vowels are standalone units
-    - Everything else (spaces, numbers, punctuation, other scripts) is
-      emitted one character at a time.
+    - Non-Devanagari characters (spaces, numbers, punctuation) are separate tokens
     """
     segments = []
     i = 0
@@ -136,58 +118,58 @@ def segment_into_aksharas(text: str) -> list:
                 i = m.end()
                 continue
 
-        # Any other character (including spaces): emit as-is.
+        # Space → keep as boundary marker
+        if ch == " ":
+            segments.append(SPACE_MARKER)
+            i += 1
+            continue
+
+        # Any other character: emit as-is
         segments.append(ch)
         i += 1
 
     return segments
 
 
-def collect_akshara_frequencies(input_path: Path) -> Counter:
-    """
-    Scan a corpus and count how often each *multi-codepoint* akshara
-    (the only kind that actually needs protecting -- a single codepoint
-    has nothing internal to split) occurs.
-    """
-    freq = Counter()
+def _iter_corpus_lines(input_path: Path):
     with open(input_path, "r", encoding="utf-8") as f:
-        for line in tqdm(f, desc="Scanning aksharas", unit=" lines"):
-            line = line.strip()
-            if not line:
+        for line in f:
+            yield line.strip()
+
+
+def build_pua_map(input_path: Path) -> AksharaPUAMap:
+    """
+    First pass over the training corpus: collect every distinct akshara
+    string that actually occurs, and assign each one a PUA code point.
+    """
+    print(f"  Scanning aksharas in {input_path.name} to build PUA map...")
+    aksharas = set()
+    for line in tqdm(_iter_corpus_lines(input_path), desc="Scanning", unit=" lines"):
+        if not line:
+            continue
+        for seg in segment_into_aksharas(line):
+            if seg == SPACE_MARKER:
                 continue
-            for seg in segment_into_aksharas(line):
-                if len(seg) > 1:
-                    freq[seg] += 1
-    return freq
+            # Only akshara-shaped segments need a PUA slot; single
+            # passthrough characters (punctuation, digits, Latin) are left
+            # as-is by remap_segments and don't need mapping.
+            if len(seg) > 1 or (0x0900 <= ord(seg) <= 0x097F):
+                aksharas.add(seg)
+
+    pua_map = AksharaPUAMap()
+    pua_map.build(aksharas)
+    print(f"  ✓ Mapped {len(aksharas):,} distinct aksharas to PUA code points")
+    return pua_map
 
 
-def build_symbol_map(freq: Counter, budget: int = PUA_BUDGET) -> dict:
+def pre_tokenize_file(input_path: Path, output_path: Path, pua_map: AksharaPUAMap):
     """
-    Assign a placeholder Private-Use-Area character to the most frequent
-    multi-codepoint aksharas, up to `budget` distinct symbols. Aksharas
-    that don't fit in the budget are left unprotected (rare long-tail
-    conjuncts fall back to ordinary, unprotected BPE behaviour).
+    Pre-tokenize a corpus file by segmenting Devanagari text into aksharas
+    and remapping each one to its PUA code point (see pua_remap.py). Real
+    spaces are preserved as real spaces; only akshara-to-akshara boundaries
+    lose their separator, which is what allows BPE to merge across them.
     """
-    most_common = [akshara for akshara, _ in freq.most_common(budget)]
-    if len(freq) > budget:
-        print(f"  NOTE: {len(freq):,} distinct multi-character akshara clusters "
-              f"found but only {budget:,} placeholder symbols are available; "
-              f"the {len(freq) - budget:,} rarest clusters will be left "
-              f"unprotected (same as plain BPE for those).")
-    return {akshara: chr(PUA_START + i) for i, akshara in enumerate(most_common)}
-
-
-def remap_file(input_path: Path, output_path: Path, symbol_map: dict):
-    """
-    Rewrite a corpus file, replacing every protected akshara with its
-    single placeholder character. Unprotected segments (single-codepoint
-    aksharas, spaces, punctuation, digits, ...) pass through unchanged, so
-    the output is a lossless, length-preserving-per-akshara re-encoding of
-    the input -- real spaces stay real spaces (SentencePiece still learns
-    normal word boundaries), and the only thing that changes is that each
-    protected akshara now looks like one atomic "character" to BPE.
-    """
-    print(f"  Pre-tokenizing: {input_path.name}")
+    print(f"  Pre-tokenizing (PUA remap): {input_path.name}")
 
     lines_processed = 0
     with open(input_path, "r", encoding="utf-8") as in_f, \
@@ -199,53 +181,12 @@ def remap_file(input_path: Path, output_path: Path, symbol_map: dict):
                 continue
 
             segments = segment_into_aksharas(line)
-            remapped = "".join(symbol_map.get(seg, seg) for seg in segments)
+            remapped = pua_map.remap_segments(segments, space_marker=SPACE_MARKER)
             out_f.write(remapped + "\n")
             lines_processed += 1
 
     print(f"  ✓ Pre-tokenized {lines_processed:,} lines")
     return output_path
-
-
-def _expand_placeholders_in_model(model_path: Path, symbol_map: dict):
-    """
-    Post-process a trained SentencePiece model, expanding every placeholder
-    character back into the original akshara string it stood for. This is
-    what lets the final .model be used directly on raw, unmodified text by
-    every other stage in the pipeline (no special wrapper needed).
-
-    Safe because the placeholder substitution done in `remap_file` was a
-    1:1, position-preserving replacement of whole aksharas: expanding every
-    placeholder occurrence inside a learned piece reconstructs exactly the
-    substring of the *original* raw text that piece corresponds to. Piece
-    IDs, order, and scores are untouched, so the merge structure the model
-    learned is fully preserved.
-    """
-    try:
-        from sentencepiece import sentencepiece_model_pb2 as spm_pb2
-    except ImportError as e:
-        raise RuntimeError(
-            "Expanding the Devanagari-aware model requires the 'protobuf' "
-            "package (bundled with sentencepiece_model_pb2). "
-            "Install it with: pip install protobuf"
-        ) from e
-
-    reverse_map = {placeholder: akshara for akshara, placeholder in symbol_map.items()}
-
-    m = spm_pb2.ModelProto()
-    with open(model_path, "rb") as f:
-        m.ParseFromString(f.read())
-
-    def expand(piece_text: str) -> str:
-        if not piece_text or not any(ch in reverse_map for ch in piece_text):
-            return piece_text
-        return "".join(reverse_map.get(ch, ch) for ch in piece_text)
-
-    for piece in m.pieces:
-        piece.piece = expand(piece.piece)
-
-    with open(model_path, "wb") as f:
-        f.write(m.SerializeToString())
 
 
 def train_spm_safe(**kwargs):
@@ -260,10 +201,6 @@ def train_spm_safe(**kwargs):
     its error message ("...Please set it to a value <= N."); we parse that
     and retry once instead of crashing the pipeline.
     """
-    # Keep the (very verbose, per-BPE-merge) SentencePiece training log
-    # down to warnings/errors unless the caller explicitly overrides it.
-    kwargs.setdefault("minloglevel", 1)
-
     try:
         spm.SentencePieceTrainer.train(**kwargs)
     except RuntimeError as e:
@@ -283,10 +220,9 @@ def train_spm_safe(**kwargs):
 def train_devanagari_aware_bpe(lang: str):
     """
     Train a Devanagari-aware BPE tokenizer:
-    1. Scan the corpus and build a placeholder-symbol map for protected aksharas
-    2. Remap the training corpus using those placeholders
-    3. Train SentencePiece BPE on the remapped text
-    4. Expand the placeholders back to real text inside the trained model
+    1. Build (or load) the akshara -> PUA code point map for this corpus
+    2. Pre-tokenize the training corpus by remapping aksharas to PUA chars
+    3. Train SentencePiece BPE on the PUA-remapped text
     """
     ensure_dirs()
 
@@ -298,6 +234,26 @@ def train_devanagari_aware_bpe(lang: str):
     tok_dir = TOKENIZER_DIR / lang
     tok_dir.mkdir(parents=True, exist_ok=True)
 
+    # Step 1: Build or load the PUA map (needed again later for decoding /
+    # evaluation, so we always persist it rather than keeping it in memory
+    # only).
+    pua_map_path = tok_dir / f"akshara_pua_map_{lang}.json"
+    if AksharaPUAMap.exists(pua_map_path):
+        print(f"  Loading existing PUA map: {pua_map_path}")
+        pua_map = AksharaPUAMap.load(pua_map_path)
+    else:
+        pua_map = build_pua_map(train_file)
+        pua_map.save(pua_map_path)
+        print(f"  ✓ PUA map saved: {pua_map_path}")
+
+    # Step 2: Pre-tokenize (PUA remap)
+    pretok_file = tok_dir / "train_pretokenized.txt"
+    if not pretok_file.exists() or pretok_file.stat().st_size == 0:
+        pre_tokenize_file(train_file, pretok_file, pua_map)
+    else:
+        print(f"  Pre-tokenized file already exists: {pretok_file}")
+
+    # Step 3: Train SentencePiece BPE on the PUA-remapped text
     model_prefix = tok_dir / f"devaware_bpe_{lang}"
     model_file = Path(str(model_prefix) + ".model")
 
@@ -305,28 +261,6 @@ def train_devanagari_aware_bpe(lang: str):
         print(f"  Model already exists: {model_file}")
         return str(model_file)
 
-    # Step 1: build the akshara placeholder map from the training corpus
-    symbol_map_file = tok_dir / "akshara_symbol_map.json"
-    if symbol_map_file.exists():
-        with open(symbol_map_file, "r", encoding="utf-8") as f:
-            symbol_map = json.load(f)
-    else:
-        print(f"  Scanning aksharas to build the protected-cluster symbol map...")
-        freq = collect_akshara_frequencies(train_file)
-        symbol_map = build_symbol_map(freq)
-        with open(symbol_map_file, "w", encoding="utf-8") as f:
-            json.dump(symbol_map, f, ensure_ascii=False, indent=2)
-        print(f"  Protecting {len(symbol_map):,} distinct akshara clusters "
-              f"(of {len(freq):,} multi-character clusters found)")
-
-    # Step 2: remap the training corpus using placeholder symbols
-    pretok_file = tok_dir / "train_pretokenized.txt"
-    if not pretok_file.exists() or pretok_file.stat().st_size == 0:
-        remap_file(train_file, pretok_file, symbol_map)
-    else:
-        print(f"  Pre-tokenized file already exists: {pretok_file}")
-
-    # Step 3: train SentencePiece BPE on the remapped text
     print(f"  Training Devanagari-aware BPE for {lang}...")
 
     train_spm_safe(
@@ -335,40 +269,44 @@ def train_devanagari_aware_bpe(lang: str):
         vocab_size=SENTENCEPIECE_VOCAB_SIZE,
         model_type="bpe",
         character_coverage=SENTENCEPIECE_CHARACTER_COVERAGE,
-        normalization_rule_name="nfkc",
+        # "identity" (not "nfkc"): the input is already PUA-remapped, and
+        # NFKC normalization behavior on Private-Use-Area code points is
+        # undefined/unreliable across ICU versions -- normalizing before
+        # the remap (Stage 1 cleaning) is the right place for that, not
+        # here.
+        normalization_rule_name="identity",
         byte_fallback=True,
         split_digits=True,
-        # We've already pre-segmented aksharas ourselves; don't let
-        # SentencePiece additionally force hard splits at Unicode-script
-        # boundaries (e.g. between a placeholder symbol and an adjacent
-        # plain Devanagari character), or it would block exactly the
-        # cross-akshara merges we're trying to enable.
-        split_by_unicode_script=False,
         num_threads=os.cpu_count() or 4,
         max_sentence_length=16384,
     )
-
-    # Step 4: expand placeholders back to real text inside the trained model
-    _expand_placeholders_in_model(model_file, symbol_map)
 
     print(f"  ✓ Model saved: {model_file}")
     return str(model_file)
 
 
 def evaluate_devanagari_tokenizer(model_path: str, lang: str):
-    """Compare our Devanagari-aware tokenizer against baseline BPE."""
-    from pipeline.stage2a_baselines import (
-        load_sample_sentences, evaluate_sentencepiece, DEPENDENT_VOWELS
-    )
+    """Compare our Devanagari-aware tokenizer against baseline BPE.
+
+    Uses DevAwareTokenizer (segmentation + PUA remap + SentencePiece) for
+    "our" side, since the raw SentencePiece model only understands
+    PUA-remapped text, not raw Devanagari. The baseline model is a plain
+    SentencePiece model trained directly on raw text, so it's evaluated
+    the normal way.
+    """
+    from pipeline.stage2a_baselines import load_sample_sentences, evaluate_sentencepiece
+    from pipeline.devaware_tokenizer import DevAwareTokenizer
 
     sentences = load_sample_sentences(lang)
     if not sentences:
         return
 
-    # Evaluate our tokenizer (the trained model has placeholders already
-    # expanded, so it can be applied directly to raw sentences)
+    tok_dir = TOKENIZER_DIR / lang
+    pua_map_path = tok_dir / f"akshara_pua_map_{lang}.json"
+
     print(f"\n  Evaluating Devanagari-aware BPE...")
-    our_result = evaluate_sentencepiece(model_path, sentences, f"DevAware-BPE-{lang}")
+    dev_tok = DevAwareTokenizer(model_path, pua_map_path)
+    our_result = _evaluate_devaware(dev_tok, sentences, f"DevAware-BPE-{lang}")
 
     # Load baseline BPE for comparison
     baseline_model = str(TOKENIZER_DIR / lang / f"sp_bpe_{lang}.model")
@@ -408,6 +346,48 @@ def evaluate_devanagari_tokenizer(model_path: str, lang: str):
     print(f"\n  ✓ Results saved: {results_file}")
 
     return results
+
+
+def _evaluate_devaware(dev_tok, sentences: list, label: str) -> dict:
+    """
+    Same metrics as stage2a.evaluate_sentencepiece, computed through the
+    DevAwareTokenizer wrapper. The vowel-split check is done on each
+    piece's *decoded* Devanagari text (piece -> PUA chars -> original
+    string), since pieces are now PUA characters, not literal matras.
+    """
+    from pipeline.stage2a_baselines import DEPENDENT_VOWELS
+
+    total_tokens = 0
+    total_chars = 0
+    vowel_splits = 0
+    total_vowels = 0
+
+    for sent in sentences:
+        pieces = dev_tok.encode_as_pieces(sent)
+        total_tokens += len(pieces)
+        total_chars += len(sent)
+
+        for piece in pieces:
+            decoded = dev_tok.piece_to_devanagari(piece)
+            for ch in decoded:
+                if ch in DEPENDENT_VOWELS:
+                    total_vowels += 1
+            clean = decoded.lstrip(" ")
+            if clean and clean[0] in DEPENDENT_VOWELS:
+                vowel_splits += 1
+
+    avg_tokens = total_tokens / max(len(sentences), 1)
+    split_pct = 100 * vowel_splits / max(total_vowels, 1)
+
+    return {
+        "tokenizer": label,
+        "sentences": len(sentences),
+        "avg_tokens_per_sentence": round(avg_tokens, 2),
+        "total_tokens": total_tokens,
+        "total_chars": total_chars,
+        "tokens_per_char": round(total_tokens / max(total_chars, 1), 4),
+        "vowel_split_pct": round(split_pct, 2),
+    }
 
 
 # ─── CLI ─────────────────────────────────────────────────────────────────────
