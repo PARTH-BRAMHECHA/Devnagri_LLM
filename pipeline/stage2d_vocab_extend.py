@@ -67,8 +67,15 @@ import argparse
 import gc
 import json
 import math
+import os
 import time
 from pathlib import Path
+
+# Reduce CUDA allocator fragmentation on repeated OOM/retry within the same
+# kernel -- PyTorch's own OOM message recommends this. Must be set before
+# the first CUDA allocation, so it's set at import time, not inside a
+# function called after torch/cuda are already in use.
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -281,12 +288,28 @@ def finetune(model, tokenizer, train_text: str, device: str, save_dir: Path,
     try:
         import bitsandbytes as bnb
         optimizer = bnb.optim.AdamW8bit(trainable_params, lr=FINETUNE_LR)
-        print("  Using bitsandbytes 8-bit AdamW (reduced optimizer memory).")
-    except ImportError:
-        print("  ⚠ bitsandbytes not available -- falling back to full-precision "
-              "AdamW. This uses substantially more GPU memory and is more "
-              "likely to OOM; `pip install bitsandbytes` is recommended.")
-        optimizer = torch.optim.AdamW(trainable_params, lr=FINETUNE_LR)
+        print("  Using bitsandbytes 8-bit AdamW (reduced optimizer memory).",
+              flush=True)
+    except Exception as e:
+        # Fully fine-tuning embed_tokens/lm_head on a 14-16GB GPU is only
+        # viable with 8-bit optimizer state. Falling back to full-precision
+        # AdamW here doesn't just run slower -- it reliably OOMs on
+        # optimizer.step() a few steps in, which wastes the whole run.
+        # Fail loudly instead of silently degrading, and flush immediately
+        # so this is never lost if the process dies shortly after (this is
+        # exactly what happened previously: the warning was printed but
+        # never made it to the log before the OOM crash ate the buffer).
+        print(f"  ✗ bitsandbytes unavailable ({type(e).__name__}: {e}). "
+              f"Full-precision AdamW over {sum(p.numel() for p in trainable_params):,} "
+              f"trainable params will almost certainly OOM on this GPU. "
+              f"Install a working bitsandbytes build first: "
+              f"`pip install -U bitsandbytes`, then restart the kernel and "
+              f"re-run (it will resume from the last checkpoint).",
+              flush=True)
+        raise RuntimeError(
+            "bitsandbytes import/init failed -- refusing to continue with "
+            "full-precision AdamW (see message above)."
+        ) from e
     total_steps = min(FINETUNE_STEPS, len(loader) * 50)  # don't schedule past what data supports many epochs of
 
     # Resume: restore actual Adam momentum/variance state (not just model
