@@ -112,7 +112,7 @@ def run_stage_2d(lang: str = "all"):
 
 
 def run_stage_3(lang: str = "all", classical_only: bool = False, verify: bool = False,
-                 use_devaware_tokenizer: bool = False):
+                 use_devaware_tokenizer: bool = False, sanity_checks: bool = False):
     """Stage 3: Compression Pipeline
 
     NOTE: `verify` defaults to False. Round-trip verification calls
@@ -130,8 +130,18 @@ def run_stage_3(lang: str = "all", classical_only: bool = False, verify: bool = 
     default. If a language has no Stage 2d checkpoint yet, that language
     falls back to the two-condition table with a printed warning, rather
     than failing the whole run.
+
+    `sanity_checks`: if True, runs the non-negotiable Stage 3 sanity checks
+    (project plan §3a-3c: toy-English round-trip, enwik8 BPC plausibility,
+    Devanagari round-trip on >=300 sentences per language) using the shared
+    compressor BEFORE any compression runs, and saves the evidence to
+    results/stage3_sanity_checks.json. Raises immediately if a
+    non-negotiable check fails, rather than continuing on to produce
+    numbers built on a broken pipeline.
     """
-    from pipeline.stage3_compress import run_compression, LLMCompressor
+    from pipeline.stage3_compress import (
+        run_compression, LLMCompressor, run_stage3_sanity_checks,
+    )
     from pipeline.config import INDIC_LLM_MODEL
 
     langs = LANGUAGES if lang == "all" else [lang]
@@ -142,6 +152,8 @@ def run_stage_3(lang: str = "all", classical_only: bool = False, verify: bool = 
         print("  (round-trip verification ENABLED — this triples model calls)")
     if use_devaware_tokenizer:
         print("  (DevAware tokenizer condition ENABLED — requires Stage 2d checkpoints)")
+    if sanity_checks:
+        print("  (non-negotiable §3a-3c sanity checks ENABLED — run before compression)")
     print("=" * 70)
 
     # Load the LLM once and reuse it across every language instead of
@@ -150,6 +162,9 @@ def run_stage_3(lang: str = "all", classical_only: bool = False, verify: bool = 
     shared_compressor = None
     if not classical_only:
         shared_compressor = LLMCompressor(INDIC_LLM_MODEL)
+
+    if sanity_checks and not classical_only:
+        run_stage3_sanity_checks(shared_compressor, langs)
 
     for l in langs:
         devaware_compressor = None
@@ -271,6 +286,14 @@ Examples:
              "using Stage 2d's vocab-extended, fine-tuned model. Requires "
              "`--stage 2d` to have been run for the target language(s) first.",
     )
+    parser.add_argument(
+        "--sanity-checks",
+        action="store_true",
+        help="In Stage 3, run the non-negotiable §3a-3c sanity checks "
+             "(toy-English round-trip, enwik8 BPC plausibility, Devanagari "
+             "round-trip on >=300 sentences/language) before compression, "
+             "and save evidence to results/stage3_sanity_checks.json.",
+    )
     args = parser.parse_args()
 
     ensure_dirs()
@@ -295,6 +318,7 @@ Examples:
             llm_compressor = run_stage_3(
                 args.lang, args.classical_only, args.verify,
                 use_devaware_tokenizer=args.use_devaware_tokenizer,
+                sanity_checks=args.sanity_checks,
             )
         elif stage == "4":
             run_stage_4(args.lang, args.classical_only, compressor=llm_compressor)
