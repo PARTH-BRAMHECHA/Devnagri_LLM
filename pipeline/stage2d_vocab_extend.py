@@ -68,6 +68,7 @@ import gc
 import json
 import math
 import os
+import shutil
 import time
 from pathlib import Path
 
@@ -430,6 +431,39 @@ def finetune(model, tokenizer, train_text: str, device: str, save_dir: Path,
     return model
 
 
+def _prune_old_checkpoints(save_dir: Path, keep_step: int, keep_last_n: int = 1):
+    """Delete periodic step_N checkpoint dirs other than the `keep_last_n`
+    most recent ones (the just-written `keep_step` plus any already-newer
+    ones, in the unlikely case of out-of-order calls). Resume logic
+    (`_find_latest_checkpoint`) only ever reads the highest step_N dir, so
+    older ones are pure dead weight -- and each one carries a full
+    embed_tokens/lm_head + Adam optimizer state, easily several GB. Left
+    unpruned, this is what fills a Kaggle 20GB working-disk quota after
+    just 3-4 checkpoints and crashes mid-run with "No space left on
+    device". `final` is never touched here.
+    """
+    if not save_dir.exists():
+        return
+    candidates = []
+    for d in save_dir.iterdir():
+        if d.is_dir() and d.name.startswith("step_"):
+            try:
+                candidates.append((int(d.name.split("_")[1]), d))
+            except (IndexError, ValueError):
+                continue
+    candidates.sort(key=lambda x: x[0])  # ascending by step
+    to_delete = candidates[:-keep_last_n] if keep_last_n > 0 else candidates
+    for step_num, d in to_delete:
+        try:
+            shutil.rmtree(d)
+            print(f"  🧹 Pruned old checkpoint: {d} (superseded by step_{keep_step})")
+        except OSError as e:
+            # Non-fatal: worst case is one extra stale checkpoint dir left
+            # around, not a reason to abort a training run that otherwise
+            # succeeded.
+            print(f"  ⚠ Could not prune {d}: {e}")
+
+
 def _save_checkpoint(model, tokenizer, save_dir: Path, step: int,
                       final: bool = False, optimizer=None):
     out_dir = save_dir / ("final" if final else f"step_{step}")
@@ -441,6 +475,13 @@ def _save_checkpoint(model, tokenizer, save_dir: Path, step: int,
         # no need to carry Adam state around after training is done.
         torch.save(optimizer.state_dict(), out_dir / "optimizer.pt")
     print(f"  ✓ Checkpoint saved: {out_dir}")
+
+    # Only periodic step_N checkpoints accumulate across a run; 'final' is
+    # a single one-off write and needs no pruning. Keep just the checkpoint
+    # we just wrote -- resume only ever reads the single highest step_N dir
+    # (see _find_latest_checkpoint), so nothing older is ever read again.
+    if not final:
+        _prune_old_checkpoints(save_dir, keep_step=step, keep_last_n=1)
 
 
 def _load_quantized_base(device: str):
