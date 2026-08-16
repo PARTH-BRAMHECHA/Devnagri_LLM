@@ -112,7 +112,8 @@ def run_stage_2d(lang: str = "all"):
 
 
 def run_stage_3(lang: str = "all", classical_only: bool = False, verify: bool = False,
-                 use_devaware_tokenizer: bool = False, sanity_checks: bool = False):
+                 use_devaware_tokenizer: bool = False, sanity_checks: bool = False,
+                 sanity_min_sentences: int = 300, force_sanity_checks: bool = False):
     """Stage 3: Compression Pipeline
 
     NOTE: `verify` defaults to False. Round-trip verification calls
@@ -164,7 +165,9 @@ def run_stage_3(lang: str = "all", classical_only: bool = False, verify: bool = 
         shared_compressor = LLMCompressor(INDIC_LLM_MODEL)
 
     if sanity_checks and not classical_only:
-        run_stage3_sanity_checks(shared_compressor, langs)
+        run_stage3_sanity_checks(shared_compressor, langs,
+                                  min_sentences=sanity_min_sentences,
+                                  force=force_sanity_checks)
 
     for l in langs:
         devaware_compressor = None
@@ -294,6 +297,23 @@ Examples:
              "round-trip on >=300 sentences/language) before compression, "
              "and save evidence to results/stage3_sanity_checks.json.",
     )
+    parser.add_argument(
+        "--sanity-min-sentences",
+        type=int,
+        default=300,
+        help="Sample size for the 3c Devanagari round-trip check (default: "
+             "300). This check requires an actual decompress(), which is "
+             "unavoidably sequential (one model call per token) -- lower "
+             "this (e.g. 60-100) for faster iteration; use 300 for the run "
+             "you'll actually report.",
+    )
+    parser.add_argument(
+        "--force-sanity-checks",
+        action="store_true",
+        help="Re-run Stage 3 sanity checks even if "
+             "results/stage3_sanity_checks.json already shows "
+             "all_passed=True for the target language(s).",
+    )
     args = parser.parse_args()
 
     ensure_dirs()
@@ -319,6 +339,8 @@ Examples:
                 args.lang, args.classical_only, args.verify,
                 use_devaware_tokenizer=args.use_devaware_tokenizer,
                 sanity_checks=args.sanity_checks,
+                sanity_min_sentences=args.sanity_min_sentences,
+                force_sanity_checks=args.force_sanity_checks,
             )
         elif stage == "4":
             run_stage_4(args.lang, args.classical_only, compressor=llm_compressor)
