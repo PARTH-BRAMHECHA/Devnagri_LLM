@@ -190,9 +190,20 @@ def benchmark_classical_compressors(text: str, label: str) -> dict:
 
 def _load_stage3_llm_result(lang: str):
     """
-    Look for a usable LLM result already computed by Stage 3 for this
+    Look for usable LLM result(s) already computed by Stage 3 for this
     language, so Stage 4 doesn't reload the 7B model and recompute the same
-    thing again. Returns the dict, or None if not available/unusable.
+    thing again.
+
+    Returns a dict with up to two keys:
+      "default"  -- model-default-tokenizer result (from "llm_compression")
+      "devaware" -- "your tokenizer" result (from
+                    "llm_compression_devaware_tokenizer"), present only if
+                    Stage 3 was run with --use-devaware-tokenizer and it
+                    succeeded.
+    Returns None if compression_results.json doesn't exist, is unreadable,
+    or has no usable default-tokenizer result (devaware alone, without a
+    default-tokenizer baseline to compare against, isn't enough to satisfy
+    the caller -- see run_benchmark).
     """
     results_file = RESULTS_DIR / lang / "compression_results.json"
     if not results_file.exists():
@@ -203,10 +214,17 @@ def _load_stage3_llm_result(lang: str):
     except (json.JSONDecodeError, OSError):
         return None
 
-    llm = data.get("llm_compression")
-    if not llm or "error" in llm:
+    default = data.get("llm_compression")
+    if not default or "error" in default:
         return None
-    return llm
+
+    out = {"default": default}
+
+    devaware = data.get("llm_compression_devaware_tokenizer")
+    if devaware and "error" not in devaware:
+        out["devaware"] = devaware
+
+    return out
 
 
 def run_benchmark(lang: str, classical_only: bool = False, compressor=None):
@@ -261,9 +279,18 @@ def run_benchmark(lang: str, classical_only: bool = False, compressor=None):
         if reused is not None:
             print(f"  Reusing LLM BPC already computed in Stage 3 "
                   f"(no reload, no recompute)")
-            all_results["llm_default_tokenizer"] = reused
-            print(f"    LLM BPC: {reused['bpc']:.4f}")
-            print(f"    Compression ratio: {reused['compression_ratio']:.3f}")
+            all_results["llm_default_tokenizer"] = reused["default"]
+            print(f"    LLM BPC: {reused['default']['bpc']:.4f}")
+            print(f"    Compression ratio: {reused['default']['compression_ratio']:.3f}")
+
+            if "devaware" in reused:
+                all_results["llm_devaware_tokenizer"] = reused["devaware"]
+                print(f"    LLM BPC (your tokenizer): {reused['devaware']['bpc']:.4f}")
+                print(f"    Compression ratio (your tokenizer): "
+                      f"{reused['devaware']['compression_ratio']:.3f}")
+            else:
+                print(f"    (no 'your tokenizer' condition in Stage 3's result for "
+                      f"{lang} -- was --use-devaware-tokenizer passed to Stage 3?)")
         else:
             try:
                 from pipeline.stage3_compress import LLMCompressor
@@ -323,9 +350,12 @@ def generate_master_table(results_dir: Path = None):
     for c in compressors:
         header += f" {c:>10}"
     header += f" {'LLM BPC':>10}"   # FIX: was a plain string, never formatted
+    header += f" {'LLM BPC*':>10}"  # * = your tokenizer (devaware, fine-tuned)
 
     print(header)
     print("  " + "─" * (len(header) - 2))
+
+    any_missing_devaware = []
 
     for lang, data in all_data.items():
         pure = data.get("pure_language", {})
@@ -350,7 +380,25 @@ def generate_master_table(results_dir: Path = None):
         else:
             row += f" {'N/A':>10}"
 
+        llm_dev = data.get("llm_devaware_tokenizer", {})
+        if "error" in llm_dev:
+            row += f" {'ERR':>10}"
+        elif llm_dev:
+            row += f" {llm_dev.get('bpc', 0):>10.3f}"
+        else:
+            row += f" {'N/A':>10}"
+            any_missing_devaware.append(lang)
+
         print(row)
+
+    print("\n  * LLM BPC* = your Devanagari-aware tokenizer + fine-tuned model.")
+    if any_missing_devaware:
+        print(f"  ⚠ 'your tokenizer' condition missing for: "
+              f"{', '.join(any_missing_devaware)}. This table is NOT the "
+              f"three-condition comparison the project plan calls for until "
+              f"every row has an 'LLM BPC*' value -- re-run Stage 3 with "
+              f"--use-devaware-tokenizer for those languages before treating "
+              f"this as final.")
 
     # Save as JSON
     master_file = results_dir / "master_results.json"
