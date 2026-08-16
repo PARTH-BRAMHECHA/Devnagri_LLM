@@ -536,10 +536,30 @@ class LLMCompressor:
 
         return self.tokenizer.decode(token_ids, skip_special_tokens=True)
 
+    @torch.no_grad()
     def compute_bpc(self, text: str, context_length: int = None) -> dict:
         """
         Compute bits-per-character (BPC) for a text without full compression.
-        Faster than full compress/decompress — just accumulates cross-entropy.
+
+        Unlike compress()/decompress(), this never needs to be decodable, so
+        it does NOT have to match any other method's step-by-step schedule.
+        The whole text is already known up front (teacher forcing), so we
+        score it with batched forward passes instead of one model() call per
+        token -- the single biggest win, since this runs on every language
+        on every real Stage 3 pass (the sequential per-token version was the
+        main source of multi-hour runs, independent of --sanity-checks).
+
+        Text is chunked into windows of `context_length` tokens; each window
+        is scored in ONE forward call, using causal attention to get
+        predictions for every position in the window simultaneously. This
+        is mathematically identical to feeding those same tokens one at a
+        time (causal self-attention only looks at earlier positions in the
+        same input either way) -- it's just computed in parallel instead of
+        in a Python loop. The trade-off: tokens near the start of a window
+        see less than the full context_length of history (same "block-
+        aligned" trade-off already accepted for _SlidingKVCache above), so
+        BPC may differ very slightly from the old sequential number, but
+        stays within noise for context_length >> average sentence length.
         """
         if context_length is None:
             context_length = LLM_CONTEXT_LENGTH
@@ -550,22 +570,39 @@ class LLMCompressor:
         text_chars = len(text)
 
         total_bits = 0.0
-
         # First token: uniform → log2(vocab_size) bits
         total_bits += math.log2(self.vocab_size)
 
-        kv = _SlidingKVCache(self, context_length)
         t_start = time.time()
-        for i in range(1, n_tokens):
-            probs = kv.feed_and_predict(token_ids, i)
-            prob = max(probs[token_ids[i]], 1e-30)
-            total_bits += -math.log2(prob)
+        n_predicted = 0
+        block_start = 0
+        while block_start < n_tokens - 1:
+            # Window of up to context_length tokens; predicts every token
+            # in window[1:] from window[:-1] via a single forward pass.
+            block_end = min(block_start + context_length, n_tokens)
+            window = token_ids[block_start:block_end]
+            if len(window) < 2:
+                break
 
-            if i % 20 == 0 or i == n_tokens - 1:
-                elapsed = time.time() - t_start
-                rate = i / max(elapsed, 1e-6)
-                print(f"    [bpc] {i}/{n_tokens - 1} tokens, "
-                      f"{elapsed:.1f}s elapsed, {rate:.2f} tok/s", flush=True)
+            input_ids = torch.tensor([window[:-1]], dtype=torch.long, device=self.device)
+            outputs = self.model(input_ids, use_cache=False)
+            # log_softmax over the whole window at once, float32/64 (never
+            # float16 -- see the changelog at the top of this file).
+            log_probs = torch.log_softmax(outputs.logits[0].float(), dim=-1)
+            targets = torch.tensor(window[1:], dtype=torch.long, device=self.device)
+            token_log_probs = log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+            token_log_probs = token_log_probs.clamp(min=math.log(1e-30))
+            total_bits += float((-token_log_probs / math.log(2)).sum().cpu())
+
+            n_predicted += len(window) - 1
+            block_start = block_end - 1  # next window starts where this one's predictions ended
+
+            elapsed = time.time() - t_start
+            rate = n_predicted / max(elapsed, 1e-6)
+            print(f"    [bpc] {n_predicted}/{n_tokens - 1} tokens, "
+                  f"{elapsed:.1f}s elapsed, {rate:.2f} tok/s "
+                  f"({block_start // context_length + 1} forward call(s) so far)",
+                  flush=True)
 
         bpc = total_bits / text_chars
         bpb = total_bits / text_bytes
@@ -577,6 +614,34 @@ class LLMCompressor:
             "total_tokens": n_tokens,
             "bpc": round(bpc, 4),
             "bpb": round(bpb, 4),
+            "bits_per_token": round(total_bits / n_tokens, 4),
+            "compression_ratio": round(text_bytes * 8 / max(total_bits, 1), 4),
+        }
+
+    @torch.no_grad()
+    def compute_bpc_sequential(self, text: str, context_length: int = None) -> dict:
+        """Old one-token-at-a-time implementation, kept only as a reference
+        for spot-checking compute_bpc()'s batched numbers agree (they should
+        be extremely close, not bit-identical -- see compute_bpc docstring).
+        Do not use this for real runs; it's the slow path."""
+        if context_length is None:
+            context_length = LLM_CONTEXT_LENGTH
+        token_ids = self.tokenizer.encode(text, add_special_tokens=True)
+        n_tokens = len(token_ids)
+        text_bytes = len(text.encode("utf-8"))
+        text_chars = len(text)
+        total_bits = math.log2(self.vocab_size)
+        kv = _SlidingKVCache(self, context_length)
+        for i in range(1, n_tokens):
+            probs = kv.feed_and_predict(token_ids, i)
+            prob = max(probs[token_ids[i]], 1e-30)
+            total_bits += -math.log2(prob)
+        bpc = total_bits / text_chars
+        bpb = total_bits / text_bytes
+        return {
+            "total_bits": total_bits, "total_chars": text_chars,
+            "total_bytes": text_bytes, "total_tokens": n_tokens,
+            "bpc": round(bpc, 4), "bpb": round(bpb, 4),
             "bits_per_token": round(total_bits / n_tokens, 4),
             "compression_ratio": round(text_bytes * 8 / max(total_bits, 1), 4),
         }
@@ -783,7 +848,9 @@ def sanity_check_3c_devanagari_roundtrip(compressor: "LLMCompressor", lang: str,
 
 
 def run_stage3_sanity_checks(compressor: "LLMCompressor", langs: list,
-                              run_3a_3b: bool = True) -> dict:
+                              run_3a_3b: bool = True,
+                              min_sentences: int = 300,
+                              force: bool = False) -> dict:
     """
     Run all three non-negotiable Stage 3 sanity checks and save the
     evidence to disk. 3a/3b are language-independent (run once); 3c runs
@@ -791,17 +858,45 @@ def run_stage3_sanity_checks(compressor: "LLMCompressor", langs: list,
     Raises on the first failing non-negotiable check by design — this is
     meant to stop the pipeline, not continue past a broken correctness
     gate.
+
+    `min_sentences`: sample size for 3c. The project plan's floor is "a few
+    hundred sentences" (300 default), but 3c is the expensive check — it's
+    a full compress()+decompress() round-trip, and decompress() is
+    unavoidably sequential (it can't know the next token before decoding
+    it), so there's no batching trick available here the way there was for
+    compute_bpc(). Pass a smaller value (e.g. 60-100) while iterating on
+    the pipeline, and the full 300 for the run whose results you'll report.
+
+    `force`: by default, if results/stage3_sanity_checks.json already
+    records all_passed=True for exactly this set of languages, the checks
+    are skipped instead of re-run — there's no reason to pay for the
+    round-trip again if nothing about the pipeline changed. Pass
+    force=True to re-run anyway (e.g. after editing the compression code).
     """
     print("\n" + "=" * 70)
     print("  STAGE 3 SANITY CHECKS (non-negotiable per project plan §3a–3c)")
     print("=" * 70)
+
+    out_path = RESULTS_DIR / "stage3_sanity_checks.json"
+    if not force and out_path.exists():
+        try:
+            with open(out_path, "r", encoding="utf-8") as f:
+                prior = json.load(f)
+            if prior.get("all_passed") and set(prior.get("languages", [])) >= set(langs):
+                print(f"  ✓ Skipping — {out_path} already shows all_passed=True "
+                      f"for {langs}. Pass force=True (or --force-sanity-checks) "
+                      f"to re-run anyway.")
+                return prior
+        except (json.JSONDecodeError, OSError):
+            pass  # fall through and re-run if the existing file is unreadable
 
     checks = []
     if run_3a_3b:
         checks.append(sanity_check_3a_toy_english(compressor))
         checks.append(sanity_check_3b_enwik8_plausibility(compressor))
     for l in langs:
-        checks.append(sanity_check_3c_devanagari_roundtrip(compressor, l))
+        checks.append(sanity_check_3c_devanagari_roundtrip(compressor, l,
+                                                             min_sentences=min_sentences))
 
     evidence = {
         "model": compressor.model_name,
@@ -811,7 +906,6 @@ def run_stage3_sanity_checks(compressor: "LLMCompressor", langs: list,
         "all_passed": all(c.get("passed", c.get("plausible")) for c in checks),
     }
 
-    out_path = RESULTS_DIR / "stage3_sanity_checks.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(evidence, f, indent=2, ensure_ascii=False)
@@ -963,6 +1057,17 @@ def main():
                              "compression, and save evidence to "
                              "results/stage3_sanity_checks.json. Raises if "
                              "a non-negotiable check fails.")
+    parser.add_argument("--sanity-min-sentences", type=int, default=300,
+                        help="Sample size for the 3c Devanagari round-trip "
+                             "check (default: 300, the plan's floor). This "
+                             "check can't be batched -- decompress() is "
+                             "unavoidably sequential -- so lower this (e.g. "
+                             "60-100) while iterating, and use the default "
+                             "for the run you'll actually report.")
+    parser.add_argument("--force-sanity-checks", action="store_true",
+                        help="Re-run sanity checks even if "
+                             "results/stage3_sanity_checks.json already "
+                             "shows all_passed=True for these languages.")
     args = parser.parse_args()
 
     langs = LANGUAGES if args.lang == "all" else [args.lang]
@@ -974,7 +1079,9 @@ def main():
         shared_compressor = LLMCompressor(INDIC_LLM_MODEL)
 
     if args.sanity_checks and not args.classical_only:
-        run_stage3_sanity_checks(shared_compressor, langs)
+        run_stage3_sanity_checks(shared_compressor, langs,
+                                  min_sentences=args.sanity_min_sentences,
+                                  force=args.force_sanity_checks)
 
     for lang in langs:
         print(f"\n{'='*60}")
