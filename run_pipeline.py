@@ -15,9 +15,17 @@ Usage:
 """
 
 import argparse
+import gc
+import os
 import sys
 import time
 from pathlib import Path
+
+# Reduce CUDA allocator fragmentation -- must be set before the first CUDA
+# allocation, so at import time, not inside a function. (stage2d_vocab_extend.py
+# already sets this for its own process; setting it here too covers runs
+# that hit Stage 3 without ever importing stage2d.)
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
 # Ensure project root is on sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -148,29 +156,52 @@ def run_stage_3(lang: str = "all", classical_only: bool = False, verify: bool = 
     # reloading a 7B model from disk per language (previously: 3 loads in
     # stage 3, another 3 in stage 4 -- 6 total for one pipeline run).
     shared_compressor = None
+    base_vocab_size = None
     if not classical_only:
         shared_compressor = LLMCompressor(INDIC_LLM_MODEL)
+        # Record the clean vocab size BEFORE any devaware attach ever
+        # resizes the shared model's embeddings, so detach can restore it.
+        base_vocab_size = shared_compressor.model.get_input_embeddings().weight.shape[0]
 
     for l in langs:
         devaware_compressor = None
         if use_devaware_tokenizer and not classical_only:
-            devaware_compressor = _load_devaware_compressor(l)
+            devaware_compressor = _load_devaware_compressor(l, shared_compressor)
+
         run_compression(l, verify=verify, classical_only=classical_only,
                          compressor=shared_compressor,
                          devaware_compressor=devaware_compressor)
 
+        # Detach the adapter / restore the shared base model's original
+        # embeddings before the next language, so we never hold two full
+        # 7B models (or stacked vocab extensions) on the GPU at once.
+        if devaware_compressor is not None:
+            from pipeline.stage2d_vocab_extend import detach_devaware_adapter
+            restored_base = detach_devaware_adapter(
+                devaware_compressor.model, shared_compressor.tokenizer, base_vocab_size
+            )
+            shared_compressor.model = restored_base
+            gc.collect()
+            import torch
+            torch.cuda.empty_cache()
+
     return shared_compressor
 
 
-def _load_devaware_compressor(lang: str):
-    """Load Stage 2d's fine-tuned model for `lang` and wrap it in an
-    LLMCompressor, or return None (with a warning) if it isn't available."""
+def _load_devaware_compressor(lang: str, shared_compressor):
+    """Attach Stage 2d's fine-tuned adapter for `lang` onto the ALREADY
+    loaded shared_compressor's base model (avoids a second full 7B model
+    on the GPU, which was the actual cause of the Stage 3 CUDA OOM), or
+    return None (with a warning) if no checkpoint is available."""
     from pipeline.stage2d_vocab_extend import load_finetuned_devaware_model
     from pipeline.stage3_compress import LLMCompressor
     from pipeline.config import INDIC_LLM_MODEL
 
     try:
-        model, tokenizer = load_finetuned_devaware_model(lang)
+        model, tokenizer = load_finetuned_devaware_model(
+            lang,
+            base_model=shared_compressor.model if shared_compressor is not None else None,
+        )
     except FileNotFoundError as e:
         print(f"  ⚠ {e}")
         print(f"  ⚠ Skipping 'your tokenizer' condition for {lang} "
