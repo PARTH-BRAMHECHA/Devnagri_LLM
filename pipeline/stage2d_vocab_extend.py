@@ -665,11 +665,32 @@ def build_vocab_extended_model(lang: str, device: str = None,
     return model, base_tokenizer
 
 
-def load_finetuned_devaware_model(lang: str, device: str = None, merge_lora: bool = True):
+def load_finetuned_devaware_model(lang: str, device: str = None, merge_lora: bool = True,
+                                   base_model=None):
     """
     Load a previously fine-tuned (Stage 2d) model + tokenizer for use as
     Stage 3c's 'your tokenizer' condition. Raises FileNotFoundError if
     Stage 2d hasn't been run for this language yet.
+
+    `base_model`: pass Stage 3's already-loaded shared LLMCompressor.model
+    here to attach the adapter to it IN PLACE instead of loading a second
+    full bf16 copy of Airavata. This is required on single-GPU setups
+    (e.g. a 14.56 GiB Kaggle T4) -- Stage 3's shared compressor already
+    occupies ~14 GiB, so loading a second full-precision base model here
+    is what was causing:
+        torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 808.00 MiB.
+    at the PeftModel.from_pretrained(...) call below -- not because the
+    LoRA adapter itself is large, but because there was no room left for
+    it once two full 7B copies were resident simultaneously.
+
+    If `base_model` is omitted, falls back to loading a fresh copy from
+    disk (only safe if nothing else is on the GPU at the time).
+
+    NOTE: when `base_model` is passed and `merge_lora=True`, merging folds
+    the LoRA weights into the shared base model's weights in place. Call
+    `detach_devaware_adapter()` afterwards to restore the original
+    (unfine-tuned) weights before reusing the shared model for the next
+    language -- otherwise merges would stack across languages.
     """
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from peft import PeftModel
@@ -684,17 +705,59 @@ def load_finetuned_devaware_model(lang: str, device: str = None, merge_lora: boo
 
     tokenizer = AutoTokenizer.from_pretrained(ckpt_dir, trust_remote_code=True)
 
-    base_model = AutoModelForCausalLM.from_pretrained(
-        INDIC_LLM_MODEL, trust_remote_code=True, torch_dtype=torch.bfloat16
-    )
-    base_model.resize_token_embeddings(len(tokenizer))
-    model = PeftModel.from_pretrained(base_model, ckpt_dir)
+    if base_model is not None:
+        # Reuse the caller's already-loaded model -- no second 7B load.
+        if len(tokenizer) != base_model.get_input_embeddings().weight.shape[0]:
+            base_model.resize_token_embeddings(len(tokenizer))
+        model = PeftModel.from_pretrained(base_model, ckpt_dir)
+    else:
+        # Fallback: fresh full bf16 load. Only safe if this is the only
+        # model on the GPU (e.g. Stage 2d standalone, not Stage 3).
+        base_model = AutoModelForCausalLM.from_pretrained(
+            INDIC_LLM_MODEL, trust_remote_code=True, torch_dtype=torch.bfloat16
+        )
+        base_model.resize_token_embeddings(len(tokenizer))
+        model = PeftModel.from_pretrained(base_model, ckpt_dir)
 
     if merge_lora:
         model = model.merge_and_unload()  # fold LoRA weights into base for faster inference
 
     model = model.to(device).eval()
     return model, tokenizer
+
+
+def detach_devaware_adapter(model, base_tokenizer, base_original_vocab_size: int):
+    """
+    Undo an in-place load_finetuned_devaware_model(..., base_model=shared_model)
+    call so the shared base model is safe to reuse for the next language,
+    without reloading anything from disk.
+
+    Handles both cases:
+      - merge_lora=False: model is still a PeftModel wrapper -> .unload()
+        strips the adapter and returns the clean base model.
+      - merge_lora=True: model IS the base model with LoRA weights already
+        merged in -- there's no adapter left to .unload(). In this case
+        the resized embedding rows for the extra devaware tokens also need
+        to be trimmed back off, since merge_and_unload() bakes the extended
+        vocabulary's rows into the weight matrix permanently.
+
+    `base_original_vocab_size`: the base model's vocab size BEFORE any
+    devaware vocab extension (i.e. len(shared_compressor.tokenizer) at
+    Stage 3 startup, before ever calling load_finetuned_devaware_model).
+    Pass this in so embeddings can be trimmed back to exactly that size.
+    """
+    from peft import PeftModel
+
+    if isinstance(model, PeftModel):
+        base_model = model.unload()
+    else:
+        # merge_lora=True path: model is the (now-merged) base model.
+        base_model = model
+        if base_model.get_input_embeddings().weight.shape[0] != base_original_vocab_size:
+            base_model.resize_token_embeddings(base_original_vocab_size)
+
+    torch.cuda.empty_cache()
+    return base_model
 
 
 # ─── CLI ─────────────────────────────────────────────────────────────────────
