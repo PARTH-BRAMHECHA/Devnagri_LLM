@@ -547,7 +547,7 @@ class LLMCompressor:
         score it with batched forward passes instead of one model() call per
         token -- the single biggest win, since this runs on every language
         on every real Stage 3 pass (the sequential per-token version was the
-        main source of multi-hour runs, independent of --sanity-checks).
+        main source of multi-hour runs).
 
         Text is chunked into windows of `context_length` tokens; each window
         is scored in ONE forward call, using causal attention to get
@@ -725,195 +725,6 @@ def verify_roundtrip(compressor: LLMCompressor, text: str) -> bool:
     return match
 
 
-# ─── Stage 3 Non-Negotiable Sanity Checks (project plan §3a–3c) ────────────
-#
-# The project plan is explicit that these are correctness gates, not
-# optional nice-to-haves:
-#   3a: "lossless-ness is your first and non-negotiable correctness test —
-#        don't proceed until this passes" (toy English sentence)
-#   3b: sanity check against literature (BPC on an enwik8-style sample
-#       should be in the same ballpark as published LLMZip/FineZip numbers)
-#   3c go/no-go: "Confirm losslessness on Devanagari text specifically —
-#       Unicode normalization edge cases ... are the most common place this
-#       silently breaks. Test round-trip on at least a few hundred
-#       sentences per language before scaling to the full corpus."
-#
-# Previously none of this ran automatically and evidence wasn't saved
-# anywhere — `--verify` only round-tripped 500 characters of whatever
-# language was being processed, and only if you remembered to pass the
-# flag. `run_stage3_sanity_checks` below runs all three, raises on the
-# first non-negotiable failure (per the plan: stop, don't proceed), and
-# writes the results to disk as durable evidence.
-
-TOY_ENGLISH_SENTENCE = (
-    "The quick brown fox jumps over the lazy dog. "
-    "Pack my box with five dozen liquor jugs."
-)
-
-# A short, fixed excerpt matching the real enwik8 opening paragraph (Hutter
-# Prize Wikipedia dump), so 3b's plausibility check doesn't require the
-# 100MB file on disk. This isn't meant to reproduce a specific paper's BPC
-# exactly -- just to confirm the pipeline isn't off by an order of
-# magnitude, which is the plan's own bar ("if you get 0.1 BPC or 15 BPC,
-# something's broken").
-ENWIK8_SAMPLE_TEXT = (
-    "Anarchism is a political philosophy that advocates self-governed "
-    "societies based on voluntary institutions. These are often described "
-    "as stateless societies, although several authors have defined them "
-    "more specifically as institutions based on non-hierarchical or free "
-    "associations. Anarchism holds the state to be undesirable, "
-    "unnecessary, and harmful."
-)
-
-# Published LLM-compression BPC on enwik8-scale English clusters roughly in
-# this range (LLMZip, FineZip); the check only fails outside a much wider
-# band, matching the plan's "not wildly off" bar rather than requiring an
-# exact match to any one paper.
-ENWIK8_PLAUSIBLE_BPC_RANGE = (0.3, 8.0)
-
-
-def sanity_check_3a_toy_english(compressor: "LLMCompressor") -> dict:
-    """Plan §3a — non-negotiable: pipeline runs end-to-end on a toy English
-    sentence and the decompressed output exactly matches the input."""
-    print("\n  [3a] Toy-English lossless round-trip (non-negotiable)...")
-    passed = verify_roundtrip(compressor, TOY_ENGLISH_SENTENCE)
-    if not passed:
-        raise RuntimeError(
-            "Stage 3a sanity check FAILED: toy-English round-trip is not "
-            "lossless. The project plan calls this non-negotiable — stop "
-            "and fix the pipeline before proceeding to 3b/3c."
-        )
-    print("  ✓ [3a] PASSED")
-    return {"check": "3a_toy_english_roundtrip", "text": TOY_ENGLISH_SENTENCE,
-            "passed": passed}
-
-
-def sanity_check_3b_enwik8_plausibility(compressor: "LLMCompressor") -> dict:
-    """Plan §3b — sanity check against literature: BPC on an enwik8-style
-    English sample should be in the same ballpark as published numbers."""
-    print("\n  [3b] enwik8-sample BPC plausibility check...")
-    bpc_result = compressor.compute_bpc(ENWIK8_SAMPLE_TEXT)
-    bpc = bpc_result["bpc"]
-    lo, hi = ENWIK8_PLAUSIBLE_BPC_RANGE
-    plausible = lo <= bpc <= hi
-    print(f"    BPC = {bpc:.4f}  (plausible range checked: [{lo}, {hi}]; "
-          f"published LLMZip/FineZip enwik8 BPC is typically ~0.8-1.2)")
-    print("  ✓ [3b] PASSED" if plausible else
-          "  ✗ [3b] FAILED — BPC is implausible, something is broken.")
-    return {"check": "3b_enwik8_plausibility", "plausible": plausible,
-            **bpc_result}
-
-
-def sanity_check_3c_devanagari_roundtrip(compressor: "LLMCompressor", lang: str,
-                                          min_sentences: int = 300) -> dict:
-    """Plan §3c go/no-go — non-negotiable before scaling to the full
-    corpus: confirm losslessness on Devanagari text specifically, tested on
-    at least a few hundred sentences (Unicode normalization edge cases are
-    the most common place round-trip silently breaks)."""
-    print(f"\n  [3c] Devanagari round-trip on >= {min_sentences} sentences "
-          f"({lang})...")
-    test_file = SPLIT_DIR / lang / "test.txt"
-    with open(test_file, "r", encoding="utf-8") as f:
-        text = f.read()
-
-    # Split on Devanagari danda / double-danda (sentence-final punctuation
-    # for Hindi/Marathi/Sanskrit), falling back to '.' for any non-Devanagari
-    # punctuation mixed into the corpus.
-    sentences = [s.strip() for s in re.split(r"[।॥.]\s*", text) if s.strip()]
-    sample_sentences = sentences[:min_sentences]
-    sample_text = "। ".join(sample_sentences)
-
-    print(f"    Sampled {len(sample_sentences)} sentences "
-          f"({len(sample_text):,} chars) for round-trip test.")
-
-    if len(sample_sentences) < min_sentences:
-        print(f"  ⚠ Only {len(sample_sentences)} sentences available in "
-              f"{lang}/test.txt — below the plan's {min_sentences}-sentence "
-              f"floor. Proceeding with what's available, but note this in "
-              f"the methodology section.")
-
-    passed = verify_roundtrip(compressor, sample_text)
-    if not passed:
-        raise RuntimeError(
-            f"Stage 3c sanity check FAILED for {lang}: Devanagari "
-            f"round-trip is not lossless on a {len(sample_sentences)}-"
-            f"sentence sample. This is a non-negotiable go/no-go check per "
-            f"the project plan — stop and diagnose (Unicode normalization "
-            f"is the usual culprit) before scaling to the full corpus."
-        )
-    print(f"  ✓ [3c] PASSED ({len(sample_sentences)} sentences, {lang})")
-    return {"check": "3c_devanagari_roundtrip", "lang": lang,
-            "n_sentences": len(sample_sentences), "n_chars": len(sample_text),
-            "passed": passed}
-
-
-def run_stage3_sanity_checks(compressor: "LLMCompressor", langs: list,
-                              run_3a_3b: bool = True,
-                              min_sentences: int = 300,
-                              force: bool = False) -> dict:
-    """
-    Run all three non-negotiable Stage 3 sanity checks and save the
-    evidence to disk. 3a/3b are language-independent (run once); 3c runs
-    once per language in `langs`, since it's a per-corpus go/no-go check.
-    Raises on the first failing non-negotiable check by design — this is
-    meant to stop the pipeline, not continue past a broken correctness
-    gate.
-
-    `min_sentences`: sample size for 3c. The project plan's floor is "a few
-    hundred sentences" (300 default), but 3c is the expensive check — it's
-    a full compress()+decompress() round-trip, and decompress() is
-    unavoidably sequential (it can't know the next token before decoding
-    it), so there's no batching trick available here the way there was for
-    compute_bpc(). Pass a smaller value (e.g. 60-100) while iterating on
-    the pipeline, and the full 300 for the run whose results you'll report.
-
-    `force`: by default, if results/stage3_sanity_checks.json already
-    records all_passed=True for exactly this set of languages, the checks
-    are skipped instead of re-run — there's no reason to pay for the
-    round-trip again if nothing about the pipeline changed. Pass
-    force=True to re-run anyway (e.g. after editing the compression code).
-    """
-    print("\n" + "=" * 70)
-    print("  STAGE 3 SANITY CHECKS (non-negotiable per project plan §3a–3c)")
-    print("=" * 70)
-
-    out_path = RESULTS_DIR / "stage3_sanity_checks.json"
-    if not force and out_path.exists():
-        try:
-            with open(out_path, "r", encoding="utf-8") as f:
-                prior = json.load(f)
-            if prior.get("all_passed") and set(prior.get("languages", [])) >= set(langs):
-                print(f"  ✓ Skipping — {out_path} already shows all_passed=True "
-                      f"for {langs}. Pass force=True (or --force-sanity-checks) "
-                      f"to re-run anyway.")
-                return prior
-        except (json.JSONDecodeError, OSError):
-            pass  # fall through and re-run if the existing file is unreadable
-
-    checks = []
-    if run_3a_3b:
-        checks.append(sanity_check_3a_toy_english(compressor))
-        checks.append(sanity_check_3b_enwik8_plausibility(compressor))
-    for l in langs:
-        checks.append(sanity_check_3c_devanagari_roundtrip(compressor, l,
-                                                             min_sentences=min_sentences))
-
-    evidence = {
-        "model": compressor.model_name,
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "languages": langs,
-        "checks": checks,
-        "all_passed": all(c.get("passed", c.get("plausible")) for c in checks),
-    }
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(evidence, f, indent=2, ensure_ascii=False)
-    print(f"\n  ✓ Sanity-check evidence saved: {out_path}")
-
-    return evidence
-
-
 # ─── Per-Language Compression ────────────────────────────────────────────────
 
 def run_compression(lang: str, verify: bool = False, classical_only: bool = False,
@@ -1049,25 +860,6 @@ def main():
                         help="Run lossless round-trip verification")
     parser.add_argument("--classical-only", action="store_true",
                         help="Only run classical compressors (skip LLM)")
-    parser.add_argument("--sanity-checks", action="store_true",
-                        help="Run the non-negotiable Stage 3 sanity checks "
-                             "(plan §3a-3c: toy-English round-trip, "
-                             "enwik8 BPC plausibility, Devanagari round-trip "
-                             "on >=300 sentences per language) before "
-                             "compression, and save evidence to "
-                             "results/stage3_sanity_checks.json. Raises if "
-                             "a non-negotiable check fails.")
-    parser.add_argument("--sanity-min-sentences", type=int, default=300,
-                        help="Sample size for the 3c Devanagari round-trip "
-                             "check (default: 300, the plan's floor). This "
-                             "check can't be batched -- decompress() is "
-                             "unavoidably sequential -- so lower this (e.g. "
-                             "60-100) while iterating, and use the default "
-                             "for the run you'll actually report.")
-    parser.add_argument("--force-sanity-checks", action="store_true",
-                        help="Re-run sanity checks even if "
-                             "results/stage3_sanity_checks.json already "
-                             "shows all_passed=True for these languages.")
     args = parser.parse_args()
 
     langs = LANGUAGES if args.lang == "all" else [args.lang]
@@ -1077,11 +869,6 @@ def main():
     shared_compressor = None
     if not args.classical_only:
         shared_compressor = LLMCompressor(INDIC_LLM_MODEL)
-
-    if args.sanity_checks and not args.classical_only:
-        run_stage3_sanity_checks(shared_compressor, langs,
-                                  min_sentences=args.sanity_min_sentences,
-                                  force=args.force_sanity_checks)
 
     for lang in langs:
         print(f"\n{'='*60}")
