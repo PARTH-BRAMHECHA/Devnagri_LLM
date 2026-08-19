@@ -14,16 +14,22 @@ peft==0.15.2
 
 # --- core HF / training stack ---
 accelerate==1.1.1
-bitsandbytes==0.44.1
+# >=0.45.5 required: older bitsandbytes imports triton.ops.matmul_perf_model,
+# which newer Triton (already on Kaggle's image) removed -> ModuleNotFoundError.
+bitsandbytes==0.48.1
 huggingface_hub==0.26.2
 tokenizers==0.20.3
 sentencepiece==0.2.0
-protobuf==4.25.5
+# >=5.26 required: Kaggle's preinstalled TensorFlow needs
+# google.protobuf.runtime_version, which only exists in protobuf 5.26+.
+# Pinning to 4.x breaks TensorFlow's import chain, which transformers
+# pulls in lazily and that takes peft down with it.
+protobuf==5.29.3
 
 # --- tokenizer / NLP utilities ---
 beautifulsoup4==4.12.3
 lxml==5.3.0
-wikiextractor==3.0.7
+wikiextractor==3.0.8
 indic-nlp-library==0.92
 regex==2024.11.6
 sacremoses==0.1.1
