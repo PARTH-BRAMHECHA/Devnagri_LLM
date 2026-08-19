@@ -726,7 +726,20 @@ def load_finetuned_devaware_model(lang: str, device: str = None, merge_lora: boo
             # away a line later. Skipping mean-resizing costs nothing and
             # removes the memory spike.
             base_model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
-        model = PeftModel.from_pretrained(base_model, ckpt_dir)
+        # autocast_adapter_dtype=False: PEFT's default (True) upcasts every
+        # adapter / modules_to_save param to fp32 for training stability.
+        # Here modules_to_save=["embed_tokens", "lm_head"] means that's not
+        # a small LoRA matrix -- it's the FULL resized embedding and output
+        # projection tables (~50k vocab x 4096 hidden). Casting both of
+        # those to fp32 while the bf16 originals are still resident is a
+        # multi-GB spike, which on top of the shared base model already
+        # occupying ~14 GiB of a 14.56 GiB T4 is what was causing:
+        #   torch.AcceleratorError: CUDA error: out of memory
+        # at PeftModel.from_pretrained() -> _cast_adapter_dtype(). We only
+        # ever run this model in eval/inference (merge_and_unload() + .eval()
+        # below), never train it here, so there's no training-stability
+        # reason to upcast -- keep everything in bf16 and skip the spike.
+        model = PeftModel.from_pretrained(base_model, ckpt_dir, autocast_adapter_dtype=False)
     else:
         # Fallback: fresh full bf16 load. Only safe if this is the only
         # model on the GPU (e.g. Stage 2d standalone, not Stage 3).
@@ -736,7 +749,8 @@ def load_finetuned_devaware_model(lang: str, device: str = None, merge_lora: boo
         # Same reasoning as above -- these rows get overwritten by the
         # checkpoint's saved embed_tokens/lm_head weights immediately below.
         base_model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
-        model = PeftModel.from_pretrained(base_model, ckpt_dir)
+        # Same fp32-upcast-spike reasoning as the base_model-reuse branch above.
+        model = PeftModel.from_pretrained(base_model, ckpt_dir, autocast_adapter_dtype=False)
 
     if merge_lora:
         model = model.merge_and_unload()  # fold LoRA weights into base for faster inference
