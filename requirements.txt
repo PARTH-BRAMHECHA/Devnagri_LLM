@@ -1,43 +1,43 @@
-# Core ML
-torch
-torchvision
-torchaudio
-transformers
-accelerate
-peft
-bitsandbytes
+# ── Devnagri_LLM pinned dependencies ────────────────────────────────────────
+# Installed via: pip install -r requirements.txt
+# Pinned so Kaggle's preinstalled defaults never get picked up and silently
+# conflict with what the pipeline code expects (e.g. torchao 0.10.0 default
+# vs peft's LoRA dispatcher requiring torchao>=0.16.0).
+#
+# torch/torchvision/torchaudio are intentionally NOT pinned here — Kaggle's
+# base image ships a CUDA-matched torch build, and reinstalling a different
+# torch version from PyPI risks losing GPU support entirely.
 
-# Tokenization
-sentencepiece
-tokenizers
-protobuf
+# --- fixes the Stage 3 crash (PeftModel.from_pretrained / torchao check) ---
+torchao==0.16.0
+peft==0.15.2
 
-# Data
-datasets
-huggingface_hub
-requests
-beautifulsoup4
-lxml
-wikiextractor
+# --- core HF / training stack ---
+accelerate==1.1.1
+bitsandbytes==0.44.1
+huggingface_hub==0.26.2
+tokenizers==0.20.3
+sentencepiece==0.2.0
+protobuf==4.25.5
 
-# Indic NLP
-indic-nlp-library
-regex
-sacremoses
+# --- tokenizer / NLP utilities ---
+beautifulsoup4==4.12.3
+lxml==5.3.0
+wikiextractor==3.0.7
+indic-nlp-library==0.92
+regex==2024.11.6
+sacremoses==0.1.1
+range-coder==1.1
 
-# Compression
-range-coder
+# --- data / reporting ---
+numpy==1.26.4
+pandas==2.2.3
+matplotlib==3.9.2
+seaborn==0.13.2
+tabulate==0.9.0
+loguru==0.7.2
+python-docx==1.1.2
+zstandard==0.23.0
 
-# Utilities
-tqdm
-pandas
-numpy
-matplotlib
-seaborn
-tabulate
-
-# Logging
-loguru
-
-# Document reading (for docx support)
-python-docx
+# --- progress bars ---
+tqdm==4.66.5
