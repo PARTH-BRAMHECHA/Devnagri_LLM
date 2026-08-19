@@ -566,7 +566,9 @@ def build_vocab_extended_model(lang: str, device: str = None,
               f"{final_dir} (delete it to force a re-run).")
         tokenizer = AutoTokenizer.from_pretrained(final_dir, trust_remote_code=True)
         model = _load_quantized_base(device)
-        model.resize_token_embeddings(len(tokenizer))
+        # mean_resizing=False: these rows are overwritten by the checkpoint's
+        # saved embed_tokens/lm_head weights on the next line anyway.
+        model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
         model = PeftModel.from_pretrained(model, final_dir)
         return model, tokenizer
 
@@ -577,7 +579,10 @@ def build_vocab_extended_model(lang: str, device: str = None,
         try:
             base_tokenizer = AutoTokenizer.from_pretrained(resume_dir, trust_remote_code=True)
             model = _load_quantized_base(device)
-            model.resize_token_embeddings(len(base_tokenizer))
+            # mean_resizing=False: overwritten by the resumed checkpoint's
+            # saved embed_tokens/lm_head weights via PeftModel.from_pretrained
+            # a couple lines down.
+            model.resize_token_embeddings(len(base_tokenizer), mean_resizing=False)
             model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
             model = PeftModel.from_pretrained(model, resume_dir, is_trainable=True)
         except torch.OutOfMemoryError:
@@ -708,7 +713,19 @@ def load_finetuned_devaware_model(lang: str, device: str = None, merge_lora: boo
     if base_model is not None:
         # Reuse the caller's already-loaded model -- no second 7B load.
         if len(tokenizer) != base_model.get_input_embeddings().weight.shape[0]:
-            base_model.resize_token_embeddings(len(tokenizer))
+            # mean_resizing=False: the default mean-resizing init computes a
+            # mean/covariance over the OLD embedding matrix and needs a full
+            # temporary copy of it to do so. On top of a full bf16 7B model
+            # already using ~14 GiB of a 14.56 GiB T4, that temp copy is what
+            # pushes this over the edge:
+            #   torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 752.00 MiB.
+            # It's also pointless work here: modules_to_save=["embed_tokens",
+            # "lm_head"] means PeftModel.from_pretrained() below immediately
+            # overwrites these rows with the actually fine-tuned weights, so
+            # whatever resize_token_embeddings initializes them to is thrown
+            # away a line later. Skipping mean-resizing costs nothing and
+            # removes the memory spike.
+            base_model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
         model = PeftModel.from_pretrained(base_model, ckpt_dir)
     else:
         # Fallback: fresh full bf16 load. Only safe if this is the only
@@ -716,7 +733,9 @@ def load_finetuned_devaware_model(lang: str, device: str = None, merge_lora: boo
         base_model = AutoModelForCausalLM.from_pretrained(
             INDIC_LLM_MODEL, trust_remote_code=True, torch_dtype=torch.bfloat16
         )
-        base_model.resize_token_embeddings(len(tokenizer))
+        # Same reasoning as above -- these rows get overwritten by the
+        # checkpoint's saved embed_tokens/lm_head weights immediately below.
+        base_model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
         model = PeftModel.from_pretrained(base_model, ckpt_dir)
 
     if merge_lora:
