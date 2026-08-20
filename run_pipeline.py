@@ -158,7 +158,17 @@ def run_stage_3(lang: str = "all", classical_only: bool = False, verify: bool = 
     shared_compressor = None
     base_vocab_size = None
     if not classical_only:
-        shared_compressor = LLMCompressor(INDIC_LLM_MODEL)
+        # quantize_4bit=True only when the DevAware adapter will also need
+        # to live on the GPU alongside this base model -- a full bf16 7B
+        # model alone already uses ~13.8 GiB of a 14.56 GiB Kaggle T4,
+        # leaving no room for the adapter/resized-embedding load and
+        # causing the Stage 3 CUDA OOM at PeftModel.from_pretrained(). See
+        # LLMCompressor.__init__'s quantize_4bit docstring for the full
+        # explanation. Plain Stage 3/4 runs (no --use-devaware-tokenizer)
+        # are unaffected and still load at full precision.
+        shared_compressor = LLMCompressor(
+            INDIC_LLM_MODEL, quantize_4bit=use_devaware_tokenizer
+        )
         # Record the clean vocab size BEFORE any devaware attach ever
         # resizes the shared model's embeddings, so detach can restore it.
         base_vocab_size = shared_compressor.model.get_input_embeddings().weight.shape[0]
