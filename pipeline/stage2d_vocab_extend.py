@@ -739,7 +739,21 @@ def load_finetuned_devaware_model(lang: str, device: str = None, merge_lora: boo
         # ever run this model in eval/inference (merge_and_unload() + .eval()
         # below), never train it here, so there's no training-stability
         # reason to upcast -- keep everything in bf16 and skip the spike.
-        model = PeftModel.from_pretrained(base_model, ckpt_dir, autocast_adapter_dtype=False)
+        #
+        # low_cpu_mem_usage=True: without this, PeftModel.from_pretrained()
+        # first materializes FRESH, randomly-initialized copies of every
+        # modules_to_save layer (our resized embed_tokens + lm_head) before
+        # overwriting them with the checkpoint's saved weights -- a ~800 MiB
+        # transient duplicate on top of the shared 13.85 GiB base model,
+        # which is what was still causing:
+        #   torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 808.00 MiB.
+        #   ... of which 724.81 MiB is free.
+        # With low_cpu_mem_usage=True, those modules_to_save layers are built
+        # on the meta device (zero memory) and the checkpoint is loaded
+        # straight into place instead, so no duplicate ever exists.
+        model = PeftModel.from_pretrained(
+            base_model, ckpt_dir, autocast_adapter_dtype=False, low_cpu_mem_usage=True
+        )
     else:
         # Fallback: fresh full bf16 load. Only safe if this is the only
         # model on the GPU (e.g. Stage 2d standalone, not Stage 3).
@@ -749,8 +763,11 @@ def load_finetuned_devaware_model(lang: str, device: str = None, merge_lora: boo
         # Same reasoning as above -- these rows get overwritten by the
         # checkpoint's saved embed_tokens/lm_head weights immediately below.
         base_model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
-        # Same fp32-upcast-spike reasoning as the base_model-reuse branch above.
-        model = PeftModel.from_pretrained(base_model, ckpt_dir, autocast_adapter_dtype=False)
+        # Same fp32-upcast-spike and modules_to_save-duplicate reasoning as
+        # the base_model-reuse branch above.
+        model = PeftModel.from_pretrained(
+            base_model, ckpt_dir, autocast_adapter_dtype=False, low_cpu_mem_usage=True
+        )
 
     if merge_lora:
         model = model.merge_and_unload()  # fold LoRA weights into base for faster inference
