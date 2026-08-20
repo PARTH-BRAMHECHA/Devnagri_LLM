@@ -332,7 +332,7 @@ class LLMCompressor:
     """
 
     def __init__(self, model_name: str, device: str = None,
-                 tokenizer=None, model=None):
+                 tokenizer=None, model=None, quantize_4bit: bool = False):
         """
         `tokenizer` / `model`: pass a pre-built (already loaded) tokenizer
         and model to use them as-is instead of loading `model_name` fresh
@@ -341,11 +341,26 @@ class LLMCompressor:
         pipeline/stage2d_vocab_extend.load_finetuned_devaware_model().
         `model_name` is still required (used for logging/labeling and as
         the fallback load path when tokenizer/model aren't supplied).
+
+        `quantize_4bit`: load the base model in 4-bit (NF4, double-quant)
+        via bitsandbytes instead of full bf16/fp16. A plain bf16 7B model
+        already uses ~13.8 GiB of a 14.56 GiB Kaggle T4 by itself -- fine
+        for Stage 3/4 alone, but when this compressor is the *shared* base
+        model that Stage 2d's fine-tuned adapter later attaches onto
+        (`run_pipeline.py`'s `--use-devaware-tokenizer` path), there's no
+        room left for the adapter/resized-embedding overwrite and it dies
+        with:
+            torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 808.00 MiB.
+        4-bit quantizing the frozen base model drops it to ~4 GiB, leaving
+        headroom for the adapter. Only pass this when the base model will
+        be shared with an adapter load; leave it False for a normal
+        Stage 3/4 run so results stay at full precision. Ignored on CPU.
         """
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.model_name = model_name
+        self.quantized_4bit = quantize_4bit and self.device == "cuda"
 
         # bfloat16 has the same exponent range as float32 (just less
         # mantissa precision), so it gives more headroom against
@@ -373,7 +388,20 @@ class LLMCompressor:
             self._debug_calls = 0
             return
 
-        print(f"  Loading LLM: {model_name} on {self.device} (dtype={model_dtype})")
+        quant_config = None
+        if self.quantized_4bit:
+            from transformers import BitsAndBytesConfig
+            print(f"  Loading LLM: {model_name} on {self.device} "
+                  f"(4-bit NF4, compute dtype={model_dtype}) -- quantized because "
+                  f"this base model will be shared with an adapter load")
+            quant_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=model_dtype,
+            )
+        else:
+            print(f"  Loading LLM: {model_name} on {self.device} (dtype={model_dtype})")
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_name, trust_remote_code=True
@@ -384,21 +412,28 @@ class LLMCompressor:
         # for the growing-KV-cache pattern used during compression. Some
         # trust_remote_code model classes don't accept attn_implementation
         # at all, so fall back cleanly if the load rejects the kwarg.
+        #
+        # NOTE: a bitsandbytes-quantized model places itself on-device via
+        # its internal device_map at load time -- calling .to(device) on it
+        # afterwards raises. Only chain .to(self.device) in the unquantized
+        # path.
+        load_kwargs = dict(
+            trust_remote_code=True,
+            torch_dtype=model_dtype,
+            quantization_config=quant_config,
+        )
         try:
             self.model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                trust_remote_code=True,
-                torch_dtype=model_dtype,
-                attn_implementation="sdpa",
-            ).to(self.device)
+                model_name, attn_implementation="sdpa", **load_kwargs,
+            )
         except (TypeError, ValueError) as e:
             print(f"  sdpa attention not supported by this model class ({e}); "
                   f"falling back to default attention implementation.")
             self.model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                trust_remote_code=True,
-                torch_dtype=model_dtype,
-            ).to(self.device)
+                model_name, **load_kwargs,
+            )
+        if not self.quantized_4bit:
+            self.model = self.model.to(self.device)
         self.model.eval()
 
         self.vocab_size = self.model.config.vocab_size
