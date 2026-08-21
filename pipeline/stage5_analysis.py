@@ -202,6 +202,24 @@ def run_analysis():
                 "llm_bpc": br.get("llm_default_tokenizer", {}).get("bpc"),
             }
 
+            # Pure (real, human-written) text vs LLM-generated text -- the
+            # text-type condition the project plan called for but the
+            # pipeline previously never produced (see stage4_benchmark's
+            # generate_llm_text). A model's own generations are close to
+            # in-distribution for it by construction, so this is expected
+            # to show a lower BPC on "llm_generated" than on
+            # "pure_language" -- report it as exactly that (a sanity/
+            # distribution check), not as a claim the model got better at
+            # compressing the LANGUAGE.
+            llm_generated = br.get("llm_generated")
+            if llm_generated and "error" not in llm_generated:
+                comparison["compression_results"][lang]["llm_generated_bpc"] = (
+                    llm_generated.get("llm_default_tokenizer", {}).get("bpc")
+                )
+                comparison["compression_results"][lang]["llm_generated_char_entropy"] = (
+                    llm_generated.get("char_entropy")
+                )
+
         if lang in tokenizer_results:
             tr = tokenizer_results[lang]
             if isinstance(tr, dict):
