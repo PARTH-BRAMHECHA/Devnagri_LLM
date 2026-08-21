@@ -378,7 +378,22 @@ class LLMCompressor:
             print(f"  Using pre-loaded model/tokenizer ({model_name}, "
                   f"vocab size {len(tokenizer)}) on {self.device}")
             self.tokenizer = tokenizer
-            self.model = model.to(self.device)
+            # Only call .to() if the model isn't already on the target
+            # device. A bitsandbytes-quantized model (e.g. the shared
+            # base model reused for the base+devaware-tokenizer ablation,
+            # which is NOT LoRA-merged and so is still actually quantized
+            # at this point, unlike the merge_and_unload()'d devaware
+            # model) places itself on-device via its internal device_map
+            # at load time and raises if .to() is called on it again --
+            # even a same-device no-op call.
+            try:
+                current_device = next(model.parameters()).device
+            except StopIteration:
+                current_device = None
+            if current_device is not None and str(current_device) == str(self.device):
+                self.model = model
+            else:
+                self.model = model.to(self.device)
             self.model.eval()
             self.vocab_size = self.model.config.vocab_size
             print(f"  Model ready. Vocab size: {self.vocab_size}")
@@ -764,7 +779,8 @@ def verify_roundtrip(compressor: LLMCompressor, text: str) -> bool:
 
 def run_compression(lang: str, verify: bool = False, classical_only: bool = False,
                      compressor: "LLMCompressor" = None,
-                     devaware_compressor: "LLMCompressor" = None):
+                     devaware_compressor: "LLMCompressor" = None,
+                     base_devaware_compressor: "LLMCompressor" = None):
     """
     Run compression pipeline for a language.
 
@@ -781,6 +797,21 @@ def run_compression(lang: str, verify: bool = False, classical_only: bool = Fals
     is reported and the results file should be read as the two-condition
     (model default + classical) comparison -- state that explicitly in the
     methodology if you haven't run Stage 2d yet.
+
+    `base_devaware_compressor`: optional third LLMCompressor -- the BASE
+    (not fine-tuned) model with its embeddings extended + smart-initialized
+    for the devaware tokenizer but never trained (see
+    pipeline.stage2d_vocab_extend.extend_tokenizer_and_smart_init and
+    run_pipeline._load_base_devaware_compressor). Together with
+    `devaware_compressor`, this completes the 2x2 ablation grid
+    (tokenizer x fine-tuning) needed to tell whether a BPC gain comes from
+    the devaware tokenizer itself or from the fine-tuning -- with only
+    `devaware_compressor`, those two effects are conflated into one number.
+    The other missing cell (fine-tuned model + default tokenizer) is filled
+    in below by reusing `devaware_compressor`'s model with `compressor`'s
+    tokenizer -- no extra model load needed, since the fine-tuned model's
+    original-vocab embedding rows are updated too (embed_tokens/lm_head are
+    fully fine-tuned, not LoRA-adapted -- see stage2d).
     """
     ensure_dirs()
 
@@ -872,6 +903,54 @@ def run_compression(lang: str, verify: bool = False, classical_only: bool = Fals
         except Exception as e:
             print(f"  DevAware LLM compression error: {e}")
             results["llm_compression_devaware_tokenizer"] = {"error": str(e)}
+
+    # Ablation cell 1/2: devaware tokenizer on the BASE (unfine-tuned)
+    # model -- embeddings for the new tokens are smart-initialized but
+    # never trained. Isolates what the tokenizer alone buys you, without
+    # any fine-tuning effect mixed in.
+    if base_devaware_compressor is not None:
+        print(f"\n  --- LLM Compression (DevAware tokenizer, base model, NOT fine-tuned) ---")
+        try:
+            print(f"  Computing BPC on {len(test_sample):,} chars...")
+            base_dev_result = base_devaware_compressor.compute_bpc(test_sample)
+            results["llm_compression_base_devaware_tokenizer"] = {
+                "model": f"{INDIC_LLM_MODEL} (vocab-extended, smart-init, NOT fine-tuned)",
+                "tokenizer": "devaware",
+                **base_dev_result,
+            }
+            print(f"    LLM BPC (base+devaware, untrained): {base_dev_result['bpc']:.4f}")
+            print(f"    Compression ratio: {base_dev_result['compression_ratio']:.3f}")
+        except Exception as e:
+            print(f"  Base+DevAware LLM compression error: {e}")
+            results["llm_compression_base_devaware_tokenizer"] = {"error": str(e)}
+
+    # Ablation cell 2/2: the fine-tuned model paired with the model's
+    # DEFAULT tokenizer instead of devaware. The default tokenizer never
+    # emits the new token ids, so this isolates "did fine-tuning alone
+    # (on the ORIGINAL vocab's embeddings, which were also updated during
+    # fine-tuning since embed_tokens/lm_head are fully fine-tuned, not
+    # LoRA-adapted) improve BPC" from any tokenizer effect. Reuses
+    # devaware_compressor's already-loaded model -- no extra GPU load.
+    if devaware_compressor is not None and compressor is not None:
+        print(f"\n  --- LLM Compression (fine-tuned model, default tokenizer) ---")
+        try:
+            finetuned_default = LLMCompressor(
+                INDIC_LLM_MODEL,
+                tokenizer=compressor.tokenizer,
+                model=devaware_compressor.model,
+            )
+            print(f"  Computing BPC on {len(test_sample):,} chars...")
+            ft_default_result = finetuned_default.compute_bpc(test_sample)
+            results["llm_compression_finetuned_default_tokenizer"] = {
+                "model": f"{INDIC_LLM_MODEL} (vocab-extended, LoRA fine-tuned)",
+                "tokenizer": "model_default",
+                **ft_default_result,
+            }
+            print(f"    LLM BPC (fine-tuned + default tokenizer): {ft_default_result['bpc']:.4f}")
+            print(f"    Compression ratio: {ft_default_result['compression_ratio']:.3f}")
+        except Exception as e:
+            print(f"  Fine-tuned+default-tokenizer LLM compression error: {e}")
+            results["llm_compression_finetuned_default_tokenizer"] = {"error": str(e)}
 
     # Save results
     results_file = RESULTS_DIR / lang / "compression_results.json"
