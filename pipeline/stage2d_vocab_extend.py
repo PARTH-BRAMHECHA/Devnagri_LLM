@@ -88,6 +88,7 @@ from pipeline.config import (
     FINETUNE_BLOCK_SIZE, FINETUNE_BATCH_SIZE, FINETUNE_GRAD_ACCUM_STEPS,
     FINETUNE_LR, FINETUNE_STEPS, FINETUNE_WARMUP_STEPS, FINETUNE_SAVE_EVERY,
     FINETUNE_LOG_EVERY, FINETUNE_MAX_TRAIN_CHARS, FINETUNE_MAX_WALL_SECONDS,
+    FINETUNE_EVAL_HOLDOUT_CHARS, FINETUNE_EVAL_MAX_BLOCKS, FINETUNE_EVAL_EVERY,
     ensure_dirs,
 )
 from pipeline.devaware_tokenizer import DevAwareTokenizer
@@ -190,6 +191,71 @@ def find_novel_merged_pieces(dev_tok: DevAwareTokenizer, base_tokenizer,
 
 # ─── Step 3: LoRA wrap + trainable embedding/head ───────────────────────────
 
+def extend_tokenizer_and_smart_init(model, base_tokenizer, dev_tok):
+    """
+    Extends `base_tokenizer` with DevAware's novel multi-akshara merged
+    pieces and resizes + smart-initializes `model`'s embeddings to match --
+    WITHOUT any LoRA wrapping or fine-tuning.
+
+    Factored out of build_vocab_extended_model() so the exact same
+    extension + smart-init step can be reused for Stage 3's "devaware
+    tokenizer, base model, NOT fine-tuned" ablation condition (see
+    run_pipeline._load_base_devaware_compressor), which needs to stop
+    right here -- before any LoRA/training -- so it isolates the
+    tokenizer's own effect from the fine-tuning effect. Without this
+    condition, a BPC gain from the finetuned+devaware condition can't be
+    attributed to the tokenizer vs. the fine-tuning itself.
+
+    Returns (model, extended_tokenizer, new_tokens). `new_tokens` is empty
+    if DevAware's tokenizer has nothing genuinely novel to add (model and
+    base_tokenizer are returned unmodified in that case).
+    """
+    print(f"  Finding novel multi-akshara merges (base vocab size={len(base_tokenizer)})...")
+    new_tokens = find_novel_merged_pieces(dev_tok, base_tokenizer)
+    print(f"  ✓ Found {len(new_tokens)} novel merged tokens to add "
+          f"(min_aksharas={VOCAB_EXTEND_MIN_AKSHARAS}, "
+          f"cap={VOCAB_EXTEND_MAX_NEW_TOKENS})")
+
+    if not new_tokens:
+        return model, base_tokenizer, []
+
+    # Capture sub-token decompositions BEFORE mutating the tokenizer with
+    # add_tokens(), since encode() on a newly-added token returns its own
+    # id afterwards, not the old decomposition.
+    old_decompositions = {
+        tok: base_tokenizer.encode(tok, add_special_tokens=False)
+        for tok in new_tokens
+    }
+
+    old_vocab_size = len(base_tokenizer)
+    base_tokenizer.add_tokens(new_tokens)
+    # mean_resizing=False: skip transformers' generic distribution-based
+    # init (which computes a temp mean/covariance over the OLD embedding
+    # matrix -- real memory + compute cost) since every new row gets
+    # overwritten immediately below by the smart (sub-token-mean) init.
+    model.resize_token_embeddings(len(base_tokenizer), mean_resizing=False)
+
+    input_emb = model.get_input_embeddings()
+    output_emb = model.get_output_embeddings()
+    tied = (output_emb is not None
+            and output_emb.weight.data_ptr() == input_emb.weight.data_ptr())
+
+    with torch.no_grad():
+        for tok, sub_ids in old_decompositions.items():
+            new_id = base_tokenizer.convert_tokens_to_ids(tok)
+            sub_ids = [sid for sid in sub_ids if sid < old_vocab_size]
+            if new_id is None or new_id < old_vocab_size or not sub_ids:
+                continue
+            sub_ids_t = torch.tensor(sub_ids, device=input_emb.weight.device)
+            input_emb.weight[new_id] = input_emb.weight[sub_ids_t].mean(dim=0)
+            if output_emb is not None and not tied:
+                output_emb.weight[new_id] = output_emb.weight[sub_ids_t].mean(dim=0)
+
+    print(f"  ✓ Vocab extended to {len(base_tokenizer)} tokens, "
+          f"new rows smart-initialized.")
+    return model, base_tokenizer, new_tokens
+
+
 def apply_lora_and_unfreeze_embeddings(model):
     from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
 
@@ -253,9 +319,29 @@ class BlockDataset(Dataset):
         return {"input_ids": input_ids, "labels": input_ids.clone()}
 
 
+def _eval_loss(model, eval_loader, device: str, max_batches: int) -> float:
+    """Mean loss over up to `max_batches` held-out blocks, model left in
+    eval mode with no grad -- cheap enough to run every FINETUNE_EVAL_EVERY
+    steps without meaningfully eating into the training wall-clock budget."""
+    model.eval()
+    total_loss, n = 0.0, 0
+    with torch.no_grad():
+        for i, batch in enumerate(eval_loader):
+            if i >= max_batches:
+                break
+            input_ids = batch["input_ids"].to(device)
+            labels = batch["labels"].to(device)
+            out = model(input_ids=input_ids, labels=labels)
+            total_loss += out.loss.item()
+            n += 1
+    model.train()
+    return total_loss / n if n > 0 else float("nan")
+
+
 def finetune(model, tokenizer, train_text: str, device: str, save_dir: Path,
              start_step: int = 0,
-             max_wall_seconds: float = FINETUNE_MAX_WALL_SECONDS):
+             max_wall_seconds: float = FINETUNE_MAX_WALL_SECONDS,
+             eval_text: str = None):
     """
     `start_step`: resume point (0 for a fresh run, >0 when continuing from
     a previously-saved step_N checkpoint -- see build_vocab_extended_model).
@@ -265,6 +351,15 @@ def finetune(model, tokenizer, train_text: str, device: str, save_dir: Path,
     gets a checkpoint written. Hitting the budget is not an error -- it
     saves and returns early; re-running the same command picks up where
     this left off.
+
+    `eval_text`: a held-out slice of the corpus (never trained on -- see
+    build_vocab_extended_model, which carves FINETUNE_EVAL_HOLDOUT_CHARS off
+    the END of train.txt before calling this). Previously this loop only
+    ever logged TRAIN loss, which can't tell "still noisy but converging"
+    apart from "converged, this is just batch variance" apart from
+    "overfitting" -- train loss goes down (or bounces) regardless of which
+    of those is actually happening. If omitted, eval-loss logging is
+    skipped entirely (train-loss-only, old behavior) rather than failing.
     """
     model.train()
     dataset = BlockDataset(train_text, tokenizer, FINETUNE_BLOCK_SIZE)
@@ -276,6 +371,31 @@ def finetune(model, tokenizer, train_text: str, device: str, save_dir: Path,
         return model
 
     loader = DataLoader(dataset, batch_size=FINETUNE_BATCH_SIZE, shuffle=True)
+
+    eval_loader = None
+    if eval_text:
+        eval_dataset = BlockDataset(eval_text, tokenizer, FINETUNE_BLOCK_SIZE)
+        if len(eval_dataset) > 0:
+            eval_loader = DataLoader(eval_dataset, batch_size=FINETUNE_BATCH_SIZE, shuffle=False)
+            print(f"  Held-out eval set: {len(eval_text):,} chars -> "
+                  f"{len(eval_dataset):,} blocks "
+                  f"(evaluating up to {FINETUNE_EVAL_MAX_BLOCKS} per pass, "
+                  f"every {FINETUNE_EVAL_EVERY} steps)")
+        else:
+            print("  ⚠ Held-out eval text too short to form even one block -- "
+                  "eval-loss tracking disabled for this run.")
+
+    # Running log of (step, train_loss, eval_loss) so "converged vs still
+    # noisy" can be inspected after the fact instead of only from scrollback.
+    # Resumes and appends rather than overwriting, across --max-hours re-runs.
+    log_path = save_dir / "training_log.json"
+    history = []
+    if log_path.exists():
+        try:
+            with open(log_path, "r", encoding="utf-8") as f:
+                history = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            history = []
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
 
@@ -413,6 +533,24 @@ def finetune(model, tokenizer, train_text: str, device: str, save_dir: Path,
                   f"ppl={math.exp(min(outputs.loss.item(), 20)):.2f}  "
                   f"({elapsed:.0f}s elapsed / {max_wall_seconds:.0f}s budget)", flush=True)
 
+        eval_loss_this_step = None
+        if eval_loader is not None and step > 0 and step % FINETUNE_EVAL_EVERY == 0:
+            eval_loss_this_step = _eval_loss(model, eval_loader, device, FINETUNE_EVAL_MAX_BLOCKS)
+            print(f"    step {step:5d}/{total_steps}  "
+                  f"HELD-OUT eval_loss={eval_loss_this_step:.4f}  "
+                  f"eval_ppl={math.exp(min(eval_loss_this_step, 20)):.2f}", flush=True)
+            history.append({
+                "step": step,
+                "train_loss": outputs.loss.item(),
+                "eval_loss": eval_loss_this_step,
+                "elapsed_s": time.time() - t0,
+            })
+            try:
+                with open(log_path, "w", encoding="utf-8") as f:
+                    json.dump(history, f, indent=2)
+            except OSError as e:
+                print(f"  ⚠ Could not write {log_path}: {e}")
+
         if step > 0 and step % FINETUNE_SAVE_EVERY == 0:
             _save_checkpoint(model, tokenizer, save_dir, step, optimizer=optimizer)
 
@@ -422,9 +560,32 @@ def finetune(model, tokenizer, train_text: str, device: str, save_dir: Path,
         print(f"  ⏱ Wall-clock budget ({max_wall_seconds:.0f}s) hit at step "
               f"{step}/{total_steps} -- checkpointing and stopping early. "
               f"Re-run the exact same command to resume from here.")
+        if eval_loader is not None:
+            final_eval = _eval_loss(model, eval_loader, device, FINETUNE_EVAL_MAX_BLOCKS)
+            print(f"    HELD-OUT eval_loss at cutoff: {final_eval:.4f}")
+            history.append({"step": step, "train_loss": None,
+                             "eval_loss": final_eval, "elapsed_s": time.time() - t0,
+                             "note": "wall_clock_cutoff"})
+            try:
+                with open(log_path, "w", encoding="utf-8") as f:
+                    json.dump(history, f, indent=2)
+            except OSError as e:
+                print(f"  ⚠ Could not write {log_path}: {e}")
         _save_checkpoint(model, tokenizer, save_dir, step, optimizer=optimizer)
         model.eval()
         return model
+
+    if eval_loader is not None:
+        final_eval = _eval_loss(model, eval_loader, device, FINETUNE_EVAL_MAX_BLOCKS)
+        print(f"    HELD-OUT eval_loss at completion: {final_eval:.4f}")
+        history.append({"step": step, "train_loss": None,
+                         "eval_loss": final_eval, "elapsed_s": time.time() - t0,
+                         "note": "final"})
+        try:
+            with open(log_path, "w", encoding="utf-8") as f:
+                json.dump(history, f, indent=2)
+        except OSError as e:
+            print(f"  ⚠ Could not write {log_path}: {e}")
 
     _save_checkpoint(model, tokenizer, save_dir, step, final=True)
     model.eval()
@@ -592,10 +753,21 @@ def build_vocab_extended_model(lang: str, device: str = None,
 
         train_file = SPLIT_DIR / lang / "train.txt"
         with open(train_file, "r", encoding="utf-8") as f:
-            train_text = f.read(FINETUNE_MAX_TRAIN_CHARS)
+            full_text = f.read(FINETUNE_MAX_TRAIN_CHARS + FINETUNE_EVAL_HOLDOUT_CHARS)
+
+        # Same held-out slice logic as the fresh-build path below, so a
+        # resumed run's eval history is measuring the same held-out data
+        # as a run that never got interrupted.
+        if len(full_text) > FINETUNE_EVAL_HOLDOUT_CHARS:
+            eval_text = full_text[-FINETUNE_EVAL_HOLDOUT_CHARS:]
+            train_text = full_text[:-FINETUNE_EVAL_HOLDOUT_CHARS][:FINETUNE_MAX_TRAIN_CHARS]
+        else:
+            eval_text = None
+            train_text = full_text[:FINETUNE_MAX_TRAIN_CHARS]
 
         model = finetune(model, base_tokenizer, train_text, device, save_dir,
-                          start_step=resume_step, max_wall_seconds=max_wall_seconds)
+                          start_step=resume_step, max_wall_seconds=max_wall_seconds,
+                          eval_text=eval_text)
         return model, base_tokenizer
 
     tok_dir = TOKENIZER_DIR / lang
@@ -613,11 +785,9 @@ def build_vocab_extended_model(lang: str, device: str = None,
         _cuda_cleanup()
         raise
 
-    print(f"  Finding novel multi-akshara merges (base vocab size={len(base_tokenizer)})...")
-    new_tokens = find_novel_merged_pieces(dev_tok, base_tokenizer)
-    print(f"  ✓ Found {len(new_tokens)} novel merged tokens to add "
-          f"(min_aksharas={VOCAB_EXTEND_MIN_AKSHARAS}, "
-          f"cap={VOCAB_EXTEND_MAX_NEW_TOKENS})")
+    model, base_tokenizer, new_tokens = extend_tokenizer_and_smart_init(
+        model, base_tokenizer, dev_tok
+    )
 
     if not new_tokens:
         print("  ⚠ No novel merged tokens found -- DevAware tokenizer isn't "
@@ -626,46 +796,33 @@ def build_vocab_extended_model(lang: str, device: str = None,
               "identical to 'model_default'. Check Stage 2b results first.")
         return model, base_tokenizer
 
-    # Capture sub-token decompositions BEFORE mutating the tokenizer with
-    # add_tokens(), since encode() on a newly-added token returns its own
-    # id afterwards, not the old decomposition.
-    old_decompositions = {
-        tok: base_tokenizer.encode(tok, add_special_tokens=False)
-        for tok in new_tokens
-    }
-
-    old_vocab_size = len(base_tokenizer)
-    base_tokenizer.add_tokens(new_tokens)
-    model.resize_token_embeddings(len(base_tokenizer))
-
-    input_emb = model.get_input_embeddings()
-    output_emb = model.get_output_embeddings()
-    tied = (output_emb is not None
-            and output_emb.weight.data_ptr() == input_emb.weight.data_ptr())
-
-    with torch.no_grad():
-        for tok, sub_ids in old_decompositions.items():
-            new_id = base_tokenizer.convert_tokens_to_ids(tok)
-            sub_ids = [sid for sid in sub_ids if sid < old_vocab_size]
-            if new_id is None or new_id < old_vocab_size or not sub_ids:
-                continue
-            sub_ids_t = torch.tensor(sub_ids, device=input_emb.weight.device)
-            input_emb.weight[new_id] = input_emb.weight[sub_ids_t].mean(dim=0)
-            if output_emb is not None and not tied:
-                output_emb.weight[new_id] = output_emb.weight[sub_ids_t].mean(dim=0)
-
-    print(f"  ✓ Vocab extended to {len(base_tokenizer)} tokens, "
-          f"new rows smart-initialized.")
-
     model = apply_lora_and_unfreeze_embeddings(model)
 
     # Load fine-tune corpus (capped for compute budget -- see config).
     train_file = SPLIT_DIR / lang / "train.txt"
     with open(train_file, "r", encoding="utf-8") as f:
-        train_text = f.read(FINETUNE_MAX_TRAIN_CHARS)
+        full_text = f.read(FINETUNE_MAX_TRAIN_CHARS + FINETUNE_EVAL_HOLDOUT_CHARS)
+
+    # Carve a held-out slice off the END of the corpus for eval-loss
+    # tracking -- never trained on, so it actually measures generalization
+    # rather than just replaying train-loss noise. Taken from the end (not
+    # a random sample) so it stays a contiguous, reproducible slice across
+    # resumed runs regardless of shuffle order inside BlockDataset.
+    if len(full_text) > FINETUNE_EVAL_HOLDOUT_CHARS:
+        eval_text = full_text[-FINETUNE_EVAL_HOLDOUT_CHARS:]
+        train_text = full_text[:-FINETUNE_EVAL_HOLDOUT_CHARS][:FINETUNE_MAX_TRAIN_CHARS]
+    else:
+        # Corpus too small to spare a held-out slice -- fall back to
+        # train-loss-only logging rather than starving training data.
+        print(f"  ⚠ Corpus ({len(full_text):,} chars) too small to carve off "
+              f"{FINETUNE_EVAL_HOLDOUT_CHARS:,} held-out chars -- "
+              f"eval-loss tracking disabled for {lang}.")
+        eval_text = None
+        train_text = full_text[:FINETUNE_MAX_TRAIN_CHARS]
 
     model = finetune(model, base_tokenizer, train_text, device, save_dir,
-                      start_step=0, max_wall_seconds=max_wall_seconds)
+                      start_step=0, max_wall_seconds=max_wall_seconds,
+                      eval_text=eval_text)
 
     return model, base_tokenizer
 
