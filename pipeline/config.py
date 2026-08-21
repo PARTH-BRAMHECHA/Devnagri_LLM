@@ -128,11 +128,35 @@ FINETUNE_BLOCK_SIZE = 512
 # 8-bit AdamW for the other half of this fix.
 FINETUNE_BATCH_SIZE = 1
 FINETUNE_GRAD_ACCUM_STEPS = 16
-FINETUNE_LR = 2e-4
+# Lowered from 2e-4 -> 5e-5. 2e-4 is a reasonable LoRA-only LR, but this run
+# also fully fine-tunes embed_tokens/lm_head (not just LoRA deltas), and the
+# training log showed loss bouncing 2.6<->4.6 late in training rather than
+# settling -- classic sign the LR is too aggressive for full-precision
+# updates on those big tensors. 5e-5 is closer to what continued-pretraining
+# recipes use for full-parameter updates; raise FINETUNE_WARMUP_STEPS
+# alongside it if you still see instability.
+FINETUNE_LR = 5e-5
 FINETUNE_STEPS = 1000
-FINETUNE_WARMUP_STEPS = 50
+# Raised from 50 -> 100 to match the lower LR -- a longer warmup keeps early
+# updates on the newly smart-initialized embedding rows small while the
+# optimizer's running variance estimate (8-bit AdamW) is still unreliable.
+FINETUNE_WARMUP_STEPS = 100
 FINETUNE_SAVE_EVERY = 200
 FINETUNE_LOG_EVERY = 20
+
+# ─── Stage 2d: held-out eval-loss tracking ──────────────────────────────────
+# The training loop previously only ever logged TRAIN loss, which can't
+# distinguish "still noisy but converging" from "converged, this is just
+# batch variance" from "actually overfitting." A held-out slice carved off
+# the END of the fine-tune corpus (never trained on) gives a real signal.
+# Chars, not steps/blocks, since it's carved before tokenization.
+FINETUNE_EVAL_HOLDOUT_CHARS = 200_000
+# Blocks sampled per eval pass (kept small -- this runs on top of training,
+# not instead of it, so it shouldn't meaningfully eat into the wall-clock
+# training budget).
+FINETUNE_EVAL_MAX_BLOCKS = 20
+# Steps between held-out eval passes.
+FINETUNE_EVAL_EVERY = 100
 # Cap how much of train.txt gets used -- this is a Kaggle-session-budget
 # knob, not a methodology choice; state whatever value you actually use in
 # the paper's methodology section.
