@@ -89,8 +89,29 @@ from pipeline.config import (
     FINETUNE_LR, FINETUNE_STEPS, FINETUNE_WARMUP_STEPS, FINETUNE_SAVE_EVERY,
     FINETUNE_LOG_EVERY, FINETUNE_MAX_TRAIN_CHARS, FINETUNE_MAX_WALL_SECONDS,
     FINETUNE_EVAL_HOLDOUT_CHARS, FINETUNE_EVAL_MAX_BLOCKS, FINETUNE_EVAL_EVERY,
-    ensure_dirs,
+    SEED, ensure_dirs,
 )
+
+
+def set_all_seeds(seed: int):
+    """Seed python/numpy/torch (+CUDA) RNGs for a reproducible fine-tune
+    run. Call once per process before any model/data loading. A single run
+    at a fixed seed is reproducible; to report variance (recommended before
+    treating a small BPC delta as a real effect rather than noise), run
+    this whole stage multiple times with different --seed values and
+    compare -- see config.SEED's docstring for the multi-seed workflow.
+    """
+    import random
+    random.seed(seed)
+    try:
+        import numpy as np
+        np.random.seed(seed)
+    except ImportError:
+        pass
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    print(f"  🎲 Seeded RNGs with seed={seed}")
 from pipeline.devaware_tokenizer import DevAwareTokenizer
 from pipeline.stage2b_devanagari_tokenizer import segment_into_aksharas
 
@@ -341,7 +362,8 @@ def _eval_loss(model, eval_loader, device: str, max_batches: int) -> float:
 def finetune(model, tokenizer, train_text: str, device: str, save_dir: Path,
              start_step: int = 0,
              max_wall_seconds: float = FINETUNE_MAX_WALL_SECONDS,
-             eval_text: str = None):
+             eval_text: str = None,
+             seed: int = None):
     """
     `start_step`: resume point (0 for a fresh run, >0 when continuing from
     a previously-saved step_N checkpoint -- see build_vocab_extended_model).
@@ -360,7 +382,19 @@ def finetune(model, tokenizer, train_text: str, device: str, save_dir: Path,
     "overfitting" -- train loss goes down (or bounces) regardless of which
     of those is actually happening. If omitted, eval-loss logging is
     skipped entirely (train-loss-only, old behavior) rather than failing.
+
+    `seed`: recorded into save_dir/seed.json (best-effort, for the
+    multi-seed variance workflow -- see config.SEED). Purely informational;
+    RNGs should already have been seeded by the caller (build_vocab_extended_model)
+    before any data loading happened.
     """
+    if seed is not None:
+        try:
+            save_dir.mkdir(parents=True, exist_ok=True)
+            with open(save_dir / "seed.json", "w", encoding="utf-8") as f:
+                json.dump({"seed": seed}, f, indent=2)
+        except OSError:
+            pass
     model.train()
     dataset = BlockDataset(train_text, tokenizer, FINETUNE_BLOCK_SIZE)
     print(f"  Fine-tune corpus: {len(train_text):,} chars -> "
@@ -690,7 +724,8 @@ def _find_latest_checkpoint(save_dir: Path):
 # ─── Orchestration ────────────────────────────────────────────────────────
 
 def build_vocab_extended_model(lang: str, device: str = None,
-                                max_wall_seconds: float = None):
+                                max_wall_seconds: float = None,
+                                seed: int = None):
     """
     Full Stage 2d pipeline for one language:
       DevAware SPM -> novel merged pieces -> extend Airavata's tokenizer
@@ -704,6 +739,12 @@ def build_vocab_extended_model(lang: str, device: str = None,
       - else, does the full fresh build (vocab extension + smart init +
         LoRA-wrap) before fine-tuning.
 
+    `seed`: RNG seed for this run (defaults to config.SEED). Runs at the
+    default seed use the plain FINETUNE_DIR/lang checkpoint path for
+    backwards compatibility; any other seed gets its own
+    FINETUNE_DIR/lang/seed_<seed> path so multiple seeds' checkpoints don't
+    overwrite each other and can be compared for variance afterwards.
+
     Returns (model, tokenizer) ready to hand to LLMCompressor.
     """
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -713,13 +754,15 @@ def build_vocab_extended_model(lang: str, device: str = None,
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     max_wall_seconds = (FINETUNE_MAX_WALL_SECONDS if max_wall_seconds is None
                          else max_wall_seconds)
+    seed = SEED if seed is None else seed
+    set_all_seeds(seed)
 
     # Best-effort reclaim of any memory left dangling by a previous crashed
     # attempt in this same process/kernel (see _cuda_cleanup docstring above
     # -- this cannot fix real leaks/fragmentation, only reduce their odds).
     _cuda_cleanup()
 
-    save_dir = FINETUNE_DIR / lang
+    save_dir = FINETUNE_DIR / lang if seed == SEED else FINETUNE_DIR / lang / f"seed_{seed}"
     final_dir = save_dir / "final"
 
     if final_dir.exists():
@@ -767,7 +810,7 @@ def build_vocab_extended_model(lang: str, device: str = None,
 
         model = finetune(model, base_tokenizer, train_text, device, save_dir,
                           start_step=resume_step, max_wall_seconds=max_wall_seconds,
-                          eval_text=eval_text)
+                          eval_text=eval_text, seed=seed)
         return model, base_tokenizer
 
     tok_dir = TOKENIZER_DIR / lang
@@ -822,17 +865,22 @@ def build_vocab_extended_model(lang: str, device: str = None,
 
     model = finetune(model, base_tokenizer, train_text, device, save_dir,
                       start_step=0, max_wall_seconds=max_wall_seconds,
-                      eval_text=eval_text)
+                      eval_text=eval_text, seed=seed)
 
     return model, base_tokenizer
 
 
 def load_finetuned_devaware_model(lang: str, device: str = None, merge_lora: bool = True,
-                                   base_model=None):
+                                   base_model=None, seed: int = None):
     """
     Load a previously fine-tuned (Stage 2d) model + tokenizer for use as
     Stage 3c's 'your tokenizer' condition. Raises FileNotFoundError if
     Stage 2d hasn't been run for this language yet.
+
+    `seed`: which seed's checkpoint to load (default: config.SEED, i.e. the
+    plain FINETUNE_DIR/lang/final path). Pass a non-default seed to load a
+    specific FINETUNE_DIR/lang/seed_<seed>/final checkpoint produced by a
+    multi-seed build_vocab_extended_model run.
 
     `base_model`: pass Stage 3's already-loaded shared LLMCompressor.model
     here to attach the adapter to it IN PLACE instead of loading a second
@@ -858,11 +906,14 @@ def load_finetuned_devaware_model(lang: str, device: str = None, merge_lora: boo
     from peft import PeftModel
 
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    ckpt_dir = FINETUNE_DIR / lang / "final"
+    seed = SEED if seed is None else seed
+    lang_dir = FINETUNE_DIR / lang if seed == SEED else FINETUNE_DIR / lang / f"seed_{seed}"
+    ckpt_dir = lang_dir / "final"
     if not ckpt_dir.exists():
+        seed_flag = "" if seed == SEED else f" --seed {seed}"
         raise FileNotFoundError(
             f"No Stage 2d checkpoint found at {ckpt_dir}. "
-            f"Run: python -m pipeline.stage2d_vocab_extend --lang {lang}"
+            f"Run: python -m pipeline.stage2d_vocab_extend --lang {lang}{seed_flag}"
         )
 
     tokenizer = AutoTokenizer.from_pretrained(ckpt_dir, trust_remote_code=True)
@@ -980,6 +1031,14 @@ def main():
              "in hours. Applies per language, not to the whole --lang all "
              "batch. Default (config.py) is 3h/language.",
     )
+    parser.add_argument(
+        "--seed", type=int, default=None,
+        help="RNG seed for this run (default: config.SEED). Runs at a "
+             "non-default seed get their own checkpoint directory "
+             "(FINETUNE_DIR/lang/seed_<seed>) so multiple seeds can be run "
+             "and compared for variance without overwriting each other -- "
+             "see config.SEED's docstring for the recommended workflow.",
+    )
     args = parser.parse_args()
 
     langs = LANGUAGES if args.lang == "all" else [args.lang]
@@ -989,7 +1048,7 @@ def main():
         print(f"\n{'='*60}")
         print(f"  STAGE 2d: VOCAB EXTENSION + FINE-TUNE — {lang.upper()}")
         print(f"{'='*60}")
-        build_vocab_extended_model(lang, max_wall_seconds=max_wall_seconds)
+        build_vocab_extended_model(lang, max_wall_seconds=max_wall_seconds, seed=args.seed)
 
     print("\n✓ Stage 2d (Vocabulary Extension + Fine-tune) complete.")
 

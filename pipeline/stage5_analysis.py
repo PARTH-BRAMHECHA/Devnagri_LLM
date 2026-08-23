@@ -106,6 +106,122 @@ def analyze_morphological_complexity(lang: str, text: str) -> dict:
     }
 
 
+def aggregate_seed_variance(result_paths: dict, metric_path: tuple = ("llm_compression", "bpc")) -> dict:
+    """
+    Combine compression_results.json files from multiple seeded runs (see
+    config.SEED / run_pipeline.py's --seed) into a mean/std summary, so a
+    BPC delta can be checked against run-to-run noise before being reported
+    as a real effect.
+
+    `result_paths`: {seed_label: path_to_compression_results.json}, e.g.
+        {
+            "seed_1": RESULTS_DIR / "hindi" / "compression_results_seed1.json",
+            "seed_2": RESULTS_DIR / "hindi" / "compression_results_seed2.json",
+            "seed_3": RESULTS_DIR / "hindi" / "compression_results_seed3.json",
+        }
+    (Point these at wherever you saved each seed's run -- e.g. by setting
+    RESULTS_DIR_SUFFIX per run, per config.py's multi-seed workflow comment.)
+
+    `metric_path`: nested-key path into each result dict identifying the
+    metric to aggregate, e.g. ("llm_compression", "bpc") for the plain
+    baseline, or ("llm_compression_devaware_tokenizer", "bpc") for the
+    devaware+fine-tuned condition.
+
+    Returns a dict with per-seed values plus mean/std/n, or an "error" key
+    if fewer than 2 usable seeds were found (variance is meaningless with
+    one data point).
+    """
+    values = {}
+    for seed_label, path in result_paths.items():
+        path = Path(path)
+        if not path.exists():
+            print(f"  ⚠ {seed_label}: {path} not found, skipping")
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"  ⚠ {seed_label}: could not read {path} ({e}), skipping")
+            continue
+
+        node = data
+        ok = True
+        for key in metric_path:
+            if not isinstance(node, dict) or key not in node:
+                ok = False
+                break
+            node = node[key]
+        if not ok or not isinstance(node, (int, float)):
+            print(f"  ⚠ {seed_label}: metric path {'.'.join(metric_path)} "
+                  f"not found or not numeric in {path}, skipping")
+            continue
+        values[seed_label] = float(node)
+
+    if len(values) < 2:
+        return {
+            "metric": ".".join(metric_path),
+            "values": values,
+            "error": f"Need at least 2 usable seeds to report variance; got {len(values)}. "
+                     f"A single-seed number should not be reported as a stable effect.",
+        }
+
+    vals = list(values.values())
+    mean = sum(vals) / len(vals)
+    variance = sum((v - mean) ** 2 for v in vals) / (len(vals) - 1)  # sample variance
+    std = math.sqrt(variance)
+
+    return {
+        "metric": ".".join(metric_path),
+        "values": values,
+        "n": len(vals),
+        "mean": round(mean, 6),
+        "std": round(std, 6),
+        "min": round(min(vals), 6),
+        "max": round(max(vals), 6),
+        "range": round(max(vals) - min(vals), 6),
+    }
+
+
+def compare_conditions_across_seeds(result_paths: dict) -> dict:
+    """
+    Convenience wrapper around aggregate_seed_variance: reports mean/std for
+    both the "no fine-tune" baseline and the "devaware tokenizer, fine-tuned"
+    condition across the same set of seeded runs, plus the delta between
+    their means relative to their combined std -- a quick, rough signal for
+    "is this delta bigger than the noise" (NOT a substitute for a proper
+    significance test, but enough to catch a delta that's clearly within
+    noise before writing it up as a finding).
+    """
+    baseline = aggregate_seed_variance(result_paths, ("llm_compression", "bpc"))
+    devaware = aggregate_seed_variance(
+        result_paths, ("llm_compression_devaware_tokenizer", "bpc")
+    )
+
+    out = {"baseline": baseline, "devaware_finetuned": devaware}
+
+    if "mean" in baseline and "mean" in devaware:
+        delta = baseline["mean"] - devaware["mean"]
+        combined_std = math.sqrt(baseline["std"] ** 2 + devaware["std"] ** 2)
+        out["delta_bpc"] = round(delta, 6)
+        out["delta_pct"] = round(100 * delta / baseline["mean"], 3) if baseline["mean"] else None
+        out["combined_std"] = round(combined_std, 6)
+        if combined_std > 0:
+            out["delta_over_combined_std"] = round(delta / combined_std, 3)
+            if abs(delta) < combined_std:
+                out["verdict"] = (
+                    "Delta is smaller than the combined across-seed std -- "
+                    "not distinguishable from run-to-run noise on this evidence."
+                )
+            else:
+                out["verdict"] = (
+                    "Delta exceeds the combined across-seed std -- more likely "
+                    "a real effect, though this is a rough check, not a "
+                    "significance test."
+                )
+
+    return out
+
+
 # ─── Cross-Lingual Comparison ───────────────────────────────────────────────
 
 def load_benchmark_results() -> dict:
@@ -290,7 +406,28 @@ def run_analysis():
 
 def main():
     parser = argparse.ArgumentParser(description="Stage 5: Cross-lingual analysis")
+    parser.add_argument(
+        "--seed-variance", nargs="+", default=None, metavar="LABEL=PATH",
+        help="Report mean/std BPC across multiple seeded runs instead of the "
+             "normal cross-lingual analysis. Pass seed_label=path pairs, e.g.: "
+             "  python -m pipeline.stage5_analysis --seed-variance "
+             "seed1=results/hindi/compression_results_seed1.json "
+             "seed2=results/hindi/compression_results_seed2.json "
+             "seed3=results/hindi/compression_results_seed3.json",
+    )
     args = parser.parse_args()
+
+    if args.seed_variance:
+        result_paths = {}
+        for item in args.seed_variance:
+            if "=" not in item:
+                print(f"  ⚠ Skipping malformed --seed-variance entry (expected LABEL=PATH): {item}")
+                continue
+            label, path = item.split("=", 1)
+            result_paths[label] = path
+        report = compare_conditions_across_seeds(result_paths)
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return
 
     run_analysis()
 

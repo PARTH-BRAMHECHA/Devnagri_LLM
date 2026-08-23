@@ -136,7 +136,15 @@ FINETUNE_GRAD_ACCUM_STEPS = 16
 # recipes use for full-parameter updates; raise FINETUNE_WARMUP_STEPS
 # alongside it if you still see instability.
 FINETUNE_LR = 5e-5
-FINETUNE_STEPS = 1000
+# Raised from 1000 -> 3000: the held-out eval_loss log was still visibly
+# descending (not plateaued) at step 1000, which means BPC results measured
+# at that point understate what the devaware-tokenizer + fine-tune
+# condition can actually achieve. If wall-clock budget (FINETUNE_MAX_WALL_SECONDS)
+# cuts a run off before reaching this many steps, the run checkpoints and
+# resumes on the next invocation rather than failing -- see
+# build_vocab_extended_model. Report the ACTUAL step count reached in the
+# paper's methodology regardless of this target.
+FINETUNE_STEPS = 3000
 # Raised from 50 -> 100 to match the lower LR -- a longer warmup keeps early
 # updates on the newly smart-initialized embedding rows small while the
 # optimizer's running variance estimate (8-bit AdamW) is still unreliable.
@@ -170,6 +178,26 @@ FINETUNE_MAX_TRAIN_CHARS = 20_000_000
 # plus two more languages' worth of budget; override with --max-hours on
 # the CLI if you're giving a single language a whole session to itself.
 FINETUNE_MAX_WALL_SECONDS = 3 * 3600  # 3h/language default
+
+# ─── Reproducibility / variance ─────────────────────────────────────────────
+# A single fine-tuning run's BPC delta over baseline is not distinguishable
+# from run-to-run noise without at least a couple of runs at different
+# seeds. Default seed for a normal run; override per-run with
+# `--seed` on stage2d's CLI (or the SEED env var) when deliberately running
+# multiple seeds to report variance -- e.g.:
+#   for s in 1 2 3; do
+#     SEED=$s RESULTS_DIR_SUFFIX=seed$s python run_pipeline.py --stage 2d
+#     SEED=$s RESULTS_DIR_SUFFIX=seed$s python run_pipeline.py --stage 3 --use-devaware-tokenizer
+#   done
+# then feed the resulting results/*/compression_results_seed*.json files
+# into pipeline.stage5_analysis.aggregate_seed_variance.
+SEED = int(os.environ.get("SEED", 42))
+
+# Appends a suffix to result/checkpoint filenames (NOT directories, so
+# multi-seed runs don't clobber each other's compression_results.json) --
+# set via the RESULTS_DIR_SUFFIX env var. Empty string = default behavior,
+# unchanged from before this was added.
+RESULTS_FILE_SUFFIX = os.environ.get("RESULTS_DIR_SUFFIX", "")
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 LOG_LEVEL = "INFO"

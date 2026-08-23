@@ -67,8 +67,17 @@ from tqdm import tqdm
 from pipeline.config import (
     SPLIT_DIR, TOKENIZER_DIR, MODEL_DIR, RESULTS_DIR, LANGUAGES,
     LLM_CONTEXT_LENGTH, COMPRESSION_BATCH_SIZE, INDIC_LLM_MODEL,
-    CLASSICAL_COMPRESSORS, ROUNDTRIP_TEST_SIZE, ensure_dirs
+    CLASSICAL_COMPRESSORS, ROUNDTRIP_TEST_SIZE, RESULTS_FILE_SUFFIX, ensure_dirs
 )
+
+
+def _results_filename(suffix: str = "") -> str:
+    """compression_results.json, or compression_results_<suffix>.json when
+    RESULTS_FILE_SUFFIX (config.py, set via the RESULTS_DIR_SUFFIX env var)
+    is non-empty -- keeps multiple seeded runs' results from overwriting
+    each other. See config.SEED's docstring for the multi-seed workflow."""
+    suffix = suffix or RESULTS_FILE_SUFFIX
+    return f"compression_results_{suffix}.json" if suffix else "compression_results.json"
 
 
 # ─── Arithmetic Coder (Pure Python, Correct Implementation) ─────────────────
@@ -777,10 +786,78 @@ def verify_roundtrip(compressor: LLMCompressor, text: str) -> bool:
 
 # ─── Per-Language Compression ────────────────────────────────────────────────
 
+def load_test_data(lang: str):
+    """Load a language's test split and return (test_text, test_sample).
+
+    Factored out of run_compression so callers (e.g. run_pipeline.py) can
+    grab the exact same LLM-evaluation sample *before* touching the shared
+    model -- see the `precomputed_llm_result` docstring on run_compression
+    for why that ordering matters.
+    """
+    test_file = SPLIT_DIR / lang / "test.txt"
+    if not test_file.exists():
+        raise FileNotFoundError(f"{test_file} not found. Run stage1 first.")
+
+    print(f"  Loading test data from {test_file}...")
+    with open(test_file, "r", encoding="utf-8") as f:
+        test_text = f.read()
+
+    # Use a reasonable sample for compression (full test can be very slow with LLM)
+    # For classical compressors, use the full test set
+    # For LLM compression, use a smaller sample
+    sample_size_chars = 50_000  # ~50K chars for LLM evaluation
+    test_sample = test_text[:sample_size_chars]
+
+    print(f"  Test set: {len(test_text):,} chars ({len(test_text.encode('utf-8')) / (1024**2):.1f} MB)")
+    print(f"  LLM sample: {len(test_sample):,} chars")
+    return test_text, test_sample
+
+
+def _bpc_fingerprint(result: dict) -> str:
+    """Cheap string fingerprint of a compute_bpc() result, used only to
+    flag suspiciously-identical rows (see _warn_if_suspiciously_identical).
+    Not a security/crypto hash -- just enough precision to tell "these two
+    runs produced bit-for-bit the same numbers" from "these are merely
+    close.\""""
+    if not result or "bpc" not in result:
+        return ""
+    return (f"{result.get('bpc'):.10f}|{result.get('total_bits', result.get('bits'))}|"
+            f"{result.get('num_tokens', result.get('token_count'))}")
+
+
+def _warn_if_suspiciously_identical(baseline: dict, finetuned_default: dict, lang: str):
+    """Sanity check for the exact bug that hit this pipeline once already:
+    the fine-tuned+default-tokenizer ablation row came out identical to
+    the no-fine-tune baseline to 4+ significant figures because both ended
+    up reading the SAME (already-mutated) underlying model object -- see
+    run_pipeline.run_stage_3's ordering fix and load_finetuned_devaware_model's
+    in-place merge_and_unload() docstring. A genuine null result (fine-tuning
+    doesn't move predictions on the original vocab) is possible, but should
+    not be bit-for-bit identical across independent forward passes -- if it
+    is, that's a strong signal the two "different" models were actually the
+    same object at eval time, not a scientific finding.
+    """
+    if not baseline or not finetuned_default:
+        return
+    if "error" in baseline or "error" in finetuned_default:
+        return
+    fp_a, fp_b = _bpc_fingerprint(baseline), _bpc_fingerprint(finetuned_default)
+    if fp_a and fp_a == fp_b:
+        print(f"\n  ⚠⚠⚠ SUSPICIOUS RESULT for {lang}: the 'no fine-tune, default "
+              f"tokenizer' baseline and the 'fine-tuned, default tokenizer' "
+              f"ablation are IDENTICAL to full precision (BPC={baseline['bpc']:.6f} "
+              f"both). This is the known failure mode where both conditions "
+              f"silently read the same underlying model weights (e.g. the "
+              f"shared base model got LoRA-merged in place before the baseline "
+              f"was computed). Verify the two runs actually used distinct model "
+              f"objects/weights before reporting this as a null result.\n")
+
+
 def run_compression(lang: str, verify: bool = False, classical_only: bool = False,
                      compressor: "LLMCompressor" = None,
                      devaware_compressor: "LLMCompressor" = None,
-                     base_devaware_compressor: "LLMCompressor" = None):
+                     base_devaware_compressor: "LLMCompressor" = None,
+                     precomputed_llm_result: dict = None):
     """
     Run compression pipeline for a language.
 
@@ -812,27 +889,31 @@ def run_compression(lang: str, verify: bool = False, classical_only: bool = Fals
     tokenizer -- no extra model load needed, since the fine-tuned model's
     original-vocab embedding rows are updated too (embed_tokens/lm_head are
     fully fine-tuned, not LoRA-adapted -- see stage2d).
+
+    `precomputed_llm_result`: pass an already-computed compute_bpc() result
+    (dict with "bpc"/"tokens"/etc.) for the plain "model default tokenizer,
+    NO fine-tune" condition, and this function will use it verbatim instead
+    of calling `compressor.compute_bpc(...)` again.
+
+    THIS MATTERS, not just as an optimization: when `devaware_compressor`
+    is built by attaching Stage 2d's adapter onto `compressor`'s own model
+    IN PLACE (load_finetuned_devaware_model(..., base_model=compressor.model,
+    merge_lora=True), which is exactly what run_pipeline.py's
+    `_load_devaware_compressor` does to save GPU memory), `compressor.model`
+    stops being a clean, un-fine-tuned model *before this function ever
+    runs* -- merge_and_unload() folds the LoRA weights into the SAME
+    underlying weight tensors `compressor` already points to. Calling
+    `compressor.compute_bpc(...)` at that point silently measures the
+    fine-tuned model under the "no fine-tune" label, which is exactly the
+    bug that produced a "fine-tuned+default-tokenizer" row identical to the
+    "no fine-tune" baseline to 4+ significant figures. The caller MUST
+    compute this result from `compressor` while it is still clean (i.e.
+    before building `devaware_compressor`) and pass it in here. See
+    run_pipeline.run_stage_3 for the corrected ordering.
     """
     ensure_dirs()
 
-    test_file = SPLIT_DIR / lang / "test.txt"
-    if not test_file.exists():
-        print(f"  ERROR: {test_file} not found. Run stage1 first.")
-        return
-
-    # Load test text
-    print(f"  Loading test data from {test_file}...")
-    with open(test_file, "r", encoding="utf-8") as f:
-        test_text = f.read()
-
-    # Use a reasonable sample for compression (full test can be very slow with LLM)
-    # For classical compressors, use the full test set
-    # For LLM compression, use a smaller sample
-    sample_size_chars = 50_000  # ~50K chars for LLM evaluation
-    test_sample = test_text[:sample_size_chars]
-
-    print(f"  Test set: {len(test_text):,} chars ({len(test_text.encode('utf-8')) / (1024**2):.1f} MB)")
-    print(f"  LLM sample: {len(test_sample):,} chars")
+    test_text, test_sample = load_test_data(lang)
 
     results = {"language": lang}
 
@@ -851,7 +932,7 @@ def run_compression(lang: str, verify: bool = False, classical_only: bool = Fals
 
     if classical_only:
         # Save and return
-        results_file = RESULTS_DIR / lang / "compression_results.json"
+        results_file = RESULTS_DIR / lang / _results_filename()
         results_file.parent.mkdir(parents=True, exist_ok=True)
         with open(results_file, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
@@ -864,16 +945,33 @@ def run_compression(lang: str, verify: bool = False, classical_only: bool = Fals
         if compressor is None:
             compressor = LLMCompressor(INDIC_LLM_MODEL)
 
-        # Verify losslessness first (on a small sample)
-        if verify:
-            verify_text = test_sample[:500]
-            roundtrip_ok = verify_roundtrip(compressor, verify_text)
-            if not roundtrip_ok:
-                print("  ⚠ Round-trip verification failed! Proceeding with caution.")
+        if precomputed_llm_result is not None:
+            # See the `precomputed_llm_result` docstring above: this branch
+            # exists specifically so this baseline is never (re)computed
+            # from `compressor` after it may have been mutated in place by
+            # a subsequent LoRA merge for the devaware conditions.
+            print("  Using precomputed baseline (captured before any "
+                  "devaware adapter was attached to the shared model).")
+            llm_result = precomputed_llm_result
+        else:
+            if devaware_compressor is not None:
+                print("  ⚠ devaware_compressor was supplied but no "
+                      "precomputed_llm_result was given -- if devaware_compressor "
+                      "was built by merging an adapter onto THIS SAME compressor's "
+                      "model in place, the baseline computed right now will be "
+                      "wrong (silently fine-tuned). See run_compression's "
+                      "precomputed_llm_result docstring.")
+            # Verify losslessness first (on a small sample)
+            if verify:
+                verify_text = test_sample[:500]
+                roundtrip_ok = verify_roundtrip(compressor, verify_text)
+                if not roundtrip_ok:
+                    print("  ⚠ Round-trip verification failed! Proceeding with caution.")
 
-        # Compute BPC on sample
-        print(f"  Computing BPC on {len(test_sample):,} chars...")
-        llm_result = compressor.compute_bpc(test_sample)
+            # Compute BPC on sample
+            print(f"  Computing BPC on {len(test_sample):,} chars...")
+            llm_result = compressor.compute_bpc(test_sample)
+
         results["llm_compression"] = {
             "model": INDIC_LLM_MODEL,
             "tokenizer": "model_default",
@@ -952,8 +1050,17 @@ def run_compression(lang: str, verify: bool = False, classical_only: bool = Fals
             print(f"  Fine-tuned+default-tokenizer LLM compression error: {e}")
             results["llm_compression_finetuned_default_tokenizer"] = {"error": str(e)}
 
+    # Sanity check: catch the known "baseline and fine-tuned-default-tokenizer
+    # rows are bit-for-bit identical because they read the same mutated
+    # model object" failure mode before it silently ships as a "null result".
+    _warn_if_suspiciously_identical(
+        results.get("llm_compression"),
+        results.get("llm_compression_finetuned_default_tokenizer"),
+        lang,
+    )
+
     # Save results
-    results_file = RESULTS_DIR / lang / "compression_results.json"
+    results_file = RESULTS_DIR / lang / _results_filename()
     results_file.parent.mkdir(parents=True, exist_ok=True)
     with open(results_file, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
