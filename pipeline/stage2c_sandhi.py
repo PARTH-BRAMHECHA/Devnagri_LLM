@@ -155,13 +155,26 @@ def train_sandhi_variant():
 
     print(f"  Training Sandhi-aware BPE for Sanskrit...")
 
-    from pipeline.stage2b_devanagari_tokenizer import pre_tokenize_file, train_spm_safe
+    from pipeline.stage2b_devanagari_tokenizer import (
+        pre_tokenize_file, train_spm_safe, build_pua_map, AksharaPUAMap
+    )
     from pipeline.config import SENTENCEPIECE_VOCAB_SIZE, SENTENCEPIECE_CHARACTER_COVERAGE
+
+    # Load or build the PUA map for this language (same map used in stage2b,
+    # since it's keyed on the base Devanagari text, not the sandhi-split variant)
+    pua_map_path = tok_dir / f"akshara_pua_map_{lang}.json"
+    if AksharaPUAMap.exists(pua_map_path):
+        print(f"  Loading existing PUA map: {pua_map_path}")
+        pua_map = AksharaPUAMap.load(pua_map_path)
+    else:
+        pua_map = build_pua_map(train_file)
+        pua_map.save(pua_map_path)
+        print(f"  ✓ PUA map saved: {pua_map_path}")
 
     # Pre-tokenize the sandhi-split text
     pretok_file = tok_dir / "train_sandhi_pretokenized.txt"
     if not pretok_file.exists() or pretok_file.stat().st_size == 0:
-        pre_tokenize_file(sandhi_train, pretok_file)
+        pre_tokenize_file(sandhi_train, pretok_file, pua_map)
 
     train_spm_safe(
         input=str(pretok_file),
