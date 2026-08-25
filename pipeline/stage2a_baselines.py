@@ -173,8 +173,18 @@ def evaluate_hf_tokenizer(tokenizer_name: str, sentences: list, label: str) -> d
     vowel_splits = 0
     total_vowels = 0
 
+    # `sentences` are actually full corpus lines (see load_sample_sentences),
+    # which after Stage 1 cleaning can run to thousands of characters -- well
+    # past the model_max_length of tokenizers like GPT-2 (1024). Tokenizing
+    # without a max_length silently produces sequences the reference model
+    # could never actually consume (hence the "...will result in indexing
+    # errors" warning) and skews the tokens/char comparison against an
+    # unrealistic sequence length. Cap to the tokenizer's own limit so the
+    # comparison reflects what each baseline model can actually handle.
+    max_len = tok.model_max_length if tok.model_max_length and tok.model_max_length < int(1e8) else None
+
     for sent in sentences:
-        tokens = tok.tokenize(sent)
+        tokens = tok.tokenize(sent, truncation=bool(max_len), max_length=max_len)
         total_tokens += len(tokens)
         total_chars += len(sent)
 
