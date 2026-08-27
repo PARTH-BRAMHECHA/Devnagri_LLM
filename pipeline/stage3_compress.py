@@ -857,7 +857,8 @@ def run_compression(lang: str, verify: bool = False, classical_only: bool = Fals
                      compressor: "LLMCompressor" = None,
                      devaware_compressor: "LLMCompressor" = None,
                      base_devaware_compressor: "LLMCompressor" = None,
-                     precomputed_llm_result: dict = None):
+                     precomputed_llm_result: dict = None,
+                     precomputed_base_devaware_result: dict = None):
     """
     Run compression pipeline for a language.
 
@@ -894,6 +895,20 @@ def run_compression(lang: str, verify: bool = False, classical_only: bool = Fals
     (dict with "bpc"/"tokens"/etc.) for the plain "model default tokenizer,
     NO fine-tune" condition, and this function will use it verbatim instead
     of calling `compressor.compute_bpc(...)` again.
+
+    `precomputed_base_devaware_result`: same idea, for the "devaware
+    tokenizer, base model, NOT fine-tuned" condition. Required whenever
+    `base_devaware_compressor` and `devaware_compressor` were built by
+    mutating the SAME underlying model object in place (extend, then
+    later LoRA-merge -- see run_pipeline._load_base_devaware_compressor
+    and _load_devaware_compressor): by the time this function runs,
+    calling `base_devaware_compressor.compute_bpc(...)` would silently
+    measure the already-merged fine-tuned model under the "not
+    fine-tuned" label -- the same conflation bug precomputed_llm_result
+    exists to prevent, one hop later. If omitted, this function falls
+    back to calling `base_devaware_compressor.compute_bpc(...)` directly,
+    which is only correct when that compressor's model was never mutated
+    afterward.
 
     THIS MATTERS, not just as an optimization: when `devaware_compressor`
     is built by attaching Stage 2d's adapter onto `compressor`'s own model
@@ -1009,8 +1024,13 @@ def run_compression(lang: str, verify: bool = False, classical_only: bool = Fals
     if base_devaware_compressor is not None:
         print(f"\n  --- LLM Compression (DevAware tokenizer, base model, NOT fine-tuned) ---")
         try:
-            print(f"  Computing BPC on {len(test_sample):,} chars...")
-            base_dev_result = base_devaware_compressor.compute_bpc(test_sample)
+            if precomputed_base_devaware_result is not None:
+                print("  Using precomputed result (captured before any "
+                      "fine-tuning was merged onto this same model).")
+                base_dev_result = precomputed_base_devaware_result
+            else:
+                print(f"  Computing BPC on {len(test_sample):,} chars...")
+                base_dev_result = base_devaware_compressor.compute_bpc(test_sample)
             results["llm_compression_base_devaware_tokenizer"] = {
                 "model": f"{INDIC_LLM_MODEL} (vocab-extended, smart-init, NOT fine-tuned)",
                 "tokenizer": "devaware",
@@ -1056,6 +1076,16 @@ def run_compression(lang: str, verify: bool = False, classical_only: bool = Fals
     _warn_if_suspiciously_identical(
         results.get("llm_compression"),
         results.get("llm_compression_finetuned_default_tokenizer"),
+        lang,
+    )
+    # Same check, one hop later: the "devaware tokenizer, NOT fine-tuned"
+    # ablation should differ from the "devaware tokenizer, fine-tuned"
+    # condition -- if they're bit-for-bit identical, base_devaware_compressor
+    # and devaware_compressor were almost certainly the same mutated model
+    # object at eval time (see precomputed_base_devaware_result docstring).
+    _warn_if_suspiciously_identical(
+        results.get("llm_compression_base_devaware_tokenizer"),
+        results.get("llm_compression_devaware_tokenizer"),
         lang,
     )
 
