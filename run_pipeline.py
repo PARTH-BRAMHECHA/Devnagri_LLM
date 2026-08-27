@@ -139,7 +139,7 @@ def run_stage_3(lang: str = "all", classical_only: bool = False, verify: bool = 
     falls back to the two-condition table with a printed warning, rather
     than failing the whole run.
     """
-    from pipeline.stage3_compress import run_compression, LLMCompressor
+    from pipeline.stage3_compress import run_compression, load_test_data, LLMCompressor
     from pipeline.config import INDIC_LLM_MODEL
 
     langs = LANGUAGES if lang == "all" else [lang]
@@ -175,12 +175,46 @@ def run_stage_3(lang: str = "all", classical_only: bool = False, verify: bool = 
 
     for l in langs:
         devaware_compressor = None
+        base_devaware_compressor = None
+        precomputed_llm_result = None
+        precomputed_base_devaware_result = None
+
+        if not classical_only:
+            # Capture the clean "no fine-tune, model-default-tokenizer"
+            # baseline BEFORE anything below ever mutates
+            # shared_compressor.model in place (vocab-extend or LoRA
+            # merge). Passing this in as `precomputed_llm_result` is not
+            # an optimization -- it's the fix for the exact bug that
+            # produced a "fine-tuned+default-tokenizer" row identical to
+            # this baseline to 4+ significant figures (see
+            # stage3_compress._warn_if_suspiciously_identical and
+            # run_compression's precomputed_llm_result docstring). If we
+            # let run_compression call compressor.compute_bpc() itself
+            # after devaware_compressor has already been attached below,
+            # it silently measures the fine-tuned model under the
+            # "no fine-tune" label.
+            _, test_sample = load_test_data(l)
+            precomputed_llm_result = shared_compressor.compute_bpc(test_sample)
+
         if use_devaware_tokenizer and not classical_only:
+            # Order matters here and mirrors the fix above: extend the
+            # vocab (untrained) and measure THAT before ever LoRA-merging
+            # fine-tuned weights onto the same model object, or the
+            # "tokenizer only, not fine-tuned" ablation would silently
+            # measure the fine-tuned model too -- the identical bug one
+            # hop later. See _load_base_devaware_compressor.
+            base_devaware_compressor = _load_base_devaware_compressor(l, shared_compressor)
+            if base_devaware_compressor is not None:
+                precomputed_base_devaware_result = base_devaware_compressor.compute_bpc(test_sample)
+
             devaware_compressor = _load_devaware_compressor(l, shared_compressor)
 
         run_compression(l, verify=verify, classical_only=classical_only,
                          compressor=shared_compressor,
-                         devaware_compressor=devaware_compressor)
+                         devaware_compressor=devaware_compressor,
+                         base_devaware_compressor=base_devaware_compressor,
+                         precomputed_llm_result=precomputed_llm_result,
+                         precomputed_base_devaware_result=precomputed_base_devaware_result)
 
         # Detach the adapter / restore the shared base model's original
         # embeddings before the next language, so we never hold two full
@@ -189,6 +223,18 @@ def run_stage_3(lang: str = "all", classical_only: bool = False, verify: bool = 
             from pipeline.stage2d_vocab_extend import detach_devaware_adapter
             restored_base = detach_devaware_adapter(
                 devaware_compressor.model, shared_compressor.tokenizer, base_vocab_size
+            )
+            shared_compressor.model = restored_base
+            gc.collect()
+            import torch
+            torch.cuda.empty_cache()
+        elif base_devaware_compressor is not None:
+            # Fine-tuned checkpoint wasn't available (see
+            # _load_devaware_compressor's FileNotFoundError branch) but
+            # the base vocab-extension still happened and needs undoing.
+            from pipeline.stage2d_vocab_extend import detach_devaware_adapter
+            restored_base = detach_devaware_adapter(
+                base_devaware_compressor.model, shared_compressor.tokenizer, base_vocab_size
             )
             shared_compressor.model = restored_base
             gc.collect()
@@ -219,6 +265,67 @@ def _load_devaware_compressor(lang: str, shared_compressor):
         return None
 
     return LLMCompressor(INDIC_LLM_MODEL, tokenizer=tokenizer, model=model)
+
+
+def _load_base_devaware_compressor(lang: str, shared_compressor):
+    """Build the 'devaware tokenizer, base model, NOT fine-tuned' ablation
+    condition: extends the ALREADY loaded shared_compressor's model with
+    DevAware's novel merged tokens and smart-initializes the new embedding
+    rows, but stops there -- no LoRA wrap, no fine-tuning. Together with
+    _load_devaware_compressor's fine-tuned result, this completes the 2x2
+    ablation grid (tokenizer x fine-tuning) needed to tell whether a BPC
+    gain comes from the tokenizer itself or from fine-tuning; see
+    extend_tokenizer_and_smart_init's docstring.
+
+    Mutates shared_compressor.model in place (same reasoning as
+    _load_devaware_compressor -- a second full 7B copy doesn't fit on a
+    14.56 GiB T4 alongside the first). The caller MUST measure this
+    condition's BPC before calling _load_devaware_compressor for the same
+    language, since that call LoRA-merges fine-tuned weights onto this
+    same (now vocab-extended) model object -- measuring after that point
+    would silently score the fine-tuned model under the "not fine-tuned"
+    label. See run_stage_3's precomputed_base_devaware_result capture.
+
+    Returns None (with a printed warning) if this language's DevAware
+    tokenizer has no novel merges to add (mirrors
+    build_vocab_extended_model's own "nothing to fine-tune" case) or if
+    Stage 2b hasn't been run for this language yet.
+    """
+    from transformers import AutoTokenizer
+    from pipeline.stage2d_vocab_extend import extend_tokenizer_and_smart_init
+    from pipeline.devaware_tokenizer import DevAwareTokenizer
+    from pipeline.stage3_compress import LLMCompressor
+    from pipeline.config import INDIC_LLM_MODEL, TOKENIZER_DIR
+
+    if shared_compressor is None:
+        return None
+
+    tok_dir = TOKENIZER_DIR / lang
+    spm_path = tok_dir / f"devaware_bpe_{lang}.model"
+    pua_path = tok_dir / f"akshara_pua_map_{lang}.json"
+    if not spm_path.exists() or not pua_path.exists():
+        print(f"  ⚠ No DevAware tokenizer found at {tok_dir} for {lang} "
+              f"(run Stage 2b first). Skipping the 'tokenizer only, not "
+              f"fine-tuned' ablation for {lang}.")
+        return None
+
+    dev_tok = DevAwareTokenizer(spm_model_path=spm_path, pua_map_path=pua_path)
+    # Fresh tokenizer object (not shared_compressor.tokenizer) so the
+    # in-place add_tokens() below never mutates the clean tokenizer that
+    # precomputed_llm_result / the finetuned_default ablation both rely on.
+    base_tokenizer = AutoTokenizer.from_pretrained(INDIC_LLM_MODEL, trust_remote_code=True)
+
+    model, extended_tokenizer, new_tokens = extend_tokenizer_and_smart_init(
+        shared_compressor.model, base_tokenizer, dev_tok
+    )
+    if not new_tokens:
+        print(f"  ⚠ DevAware tokenizer adds nothing new for {lang} -- "
+              f"skipping the 'tokenizer only, not fine-tuned' ablation "
+              f"(it would be identical to model_default).")
+        return None
+
+    shared_compressor.model = model
+    return LLMCompressor(INDIC_LLM_MODEL, tokenizer=extended_tokenizer, model=model)
 
 
 def run_stage_4(lang: str = "all", classical_only: bool = False, compressor=None):
