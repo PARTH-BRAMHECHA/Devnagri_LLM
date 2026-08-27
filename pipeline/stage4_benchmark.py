@@ -288,6 +288,11 @@ def generate_llm_text(compressor, lang: str, n_chars: int = 20_000,
     chunk_new_tokens = 256
     max_chunks = 40  # safety cap regardless of n_chars, to bound worst-case time
     chunks_done = 0
+    # How many consecutive chunks were allowed to hit EOS immediately
+    # before we gave up (see the "stop early on repeated empty chunks"
+    # note below) -- a diagnostic, printed once at the end.
+    empty_chunks_seen = 0
+    max_consecutive_empty = 3
 
     print(f"  Generating LLM text for {lang} (target {n_chars:,} chars, "
           f"seeded from a short prompt)...")
@@ -301,17 +306,47 @@ def generate_llm_text(compressor, lang: str, n_chars: int = 20_000,
             output_ids = model.generate(
                 input_ids,
                 max_new_tokens=chunk_new_tokens,
+                # Without this, a single early EOS token (very easy to hit
+                # right after a rolling-context restart, since the model
+                # sees a truncated 2000-char window with no obvious
+                # continuation cue) makes generate() stop after 0-1 real
+                # tokens, decode() to an empty/whitespace string, and the
+                # old code broke out of the WHOLE while loop on that one
+                # empty chunk -- which is exactly why a prior run generated
+                # 1,546 of a requested 20,000 chars. min_new_tokens forces
+                # each chunk to produce a real amount of text before EOS is
+                # allowed to end it.
+                min_new_tokens=chunk_new_tokens // 2,
                 do_sample=True,
                 temperature=0.9,
                 top_p=0.95,
+                # Discourage the degenerate short-loop-into-EOS pattern
+                # (repeating a phrase until the model talks itself into an
+                # end token) that min_new_tokens alone doesn't prevent.
+                repetition_penalty=1.3,
+                no_repeat_ngram_size=4,
                 pad_token_id=tokenizer.eos_token_id or tokenizer.pad_token_id,
             )
         new_ids = output_ids[0][input_ids.shape[1]:]
         new_text = tokenizer.decode(new_ids, skip_special_tokens=True)
         if not new_text.strip():
-            # Model produced nothing new (e.g. hit EOS immediately) --
-            # stop rather than looping forever on an empty continuation.
-            break
+            # Even with min_new_tokens forcing real token count, decoded
+            # text can still come out empty/whitespace-only (e.g. an
+            # unusual run of special/control tokens). Don't give up on the
+            # first occurrence -- restart the rolling context from the
+            # original seed prompt and retry, and only stop the whole
+            # generation early if this keeps happening.
+            empty_chunks_seen += 1
+            print(f"  ⚠ Chunk {chunks_done + 1} decoded to empty text "
+                  f"({empty_chunks_seen}/{max_consecutive_empty} consecutive) "
+                  f"-- retrying from the seed prompt.")
+            if empty_chunks_seen >= max_consecutive_empty:
+                print(f"  ⚠ {max_consecutive_empty} consecutive empty chunks -- "
+                      f"stopping generation early rather than looping forever.")
+                break
+            generated_text += " " + prompt
+            continue
+        empty_chunks_seen = 0
         generated_text += new_text
         chunks_done += 1
 
