@@ -38,6 +38,7 @@ from tqdm import tqdm
 from pipeline.config import (
     RESULTS_DIR, LANGUAGES, INDIC_LLM_MODEL, SEED, RESULTS_FILE_SUFFIX, ensure_dirs
 )
+from pipeline.error_diagnostics import run_with_diagnostics
 
 # XNLI only ships a Hindi subset -- Marathi/Sanskrit have no equivalent
 # labeled NLI set on the Hub as of writing. Extend this map if/when one
@@ -184,7 +185,9 @@ def main():
     langs = LANGUAGES if args.lang == "all" else [args.lang]
     for lang in langs:
         try:
-            run_downstream(lang, seed=args.seed, n_train=args.n_train, n_eval=args.n_eval)
+            run_with_diagnostics(
+                run_downstream, lang, seed=args.seed, n_train=args.n_train, n_eval=args.n_eval
+            )
         except FileNotFoundError as e:
             print(f"  ⚠ Skipping {lang}: {e}")
 

@@ -32,6 +32,7 @@ import numpy as np
 import torch
 
 from pipeline.config import RESULTS_DIR, LANGUAGES, INDIC_LLM_MODEL, SEED, ensure_dirs
+from pipeline.error_diagnostics import run_with_diagnostics
 
 GEN_CHARS_PER_SAMPLE = 400  # short enough for a rater to read quickly per row
 N_SAMPLES_DEFAULT = 20
@@ -189,9 +190,9 @@ def main():
 
     ensure_dirs()
     if args.aggregate:
-        aggregate_ratings(args.lang)
+        run_with_diagnostics(aggregate_ratings, args.lang)
     else:
-        rows = generate_paired_samples(args.lang, args.n_samples, seed=args.seed)
+        rows = run_with_diagnostics(generate_paired_samples, args.lang, args.n_samples, seed=args.seed)
         write_rating_sheet(args.lang, rows)
 
 
