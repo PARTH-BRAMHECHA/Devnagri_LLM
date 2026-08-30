@@ -98,6 +98,70 @@ def _compute_model_perplexity(model, token_ids: list, device: str) -> float:
     return math.exp(loss)
 
 
+# ─── Bootstrap CI over the eval set ─────────────────────────────────────────
+#
+# Multi-seed variance (config.SEED / stage5_analysis.aggregate_seed_variance)
+# tells you how much BPC moves across different fine-tune RUNS. It says
+# nothing about how much it'd move on a different draw of the SAME test
+# set at a FIXED seed -- e.g. if the 5.7MB test corpus happens to contain
+# one unusually easy/hard document, a single BPC number from it could be
+# misleading regardless of how many seeds you average over. This resamples
+# the forward-pass BLOCKS already computed by a single
+# compute_bpc(..., track_blocks=True) call (no extra model calls) to give
+# a second, complementary CI.
+
+def bootstrap_bpc_ci(block_stats: list, n_boot: int = 2000, ci: float = 0.95,
+                      seed: int = 0) -> dict:
+    """
+    Bootstrap a CI for bits-per-token from the per-block (window) bit/token
+    counts returned by LLMCompressor.compute_bpc(..., track_blocks=True).
+
+    Reports bits_per_token (exact -- no chars-per-token approximation
+    needed, since block_stats gives token counts directly) rather than BPC
+    itself. To get an approximate BPC CI, scale the bits_per_token CI by
+    the corpus's overall (chars / tokens) ratio -- see the "bpc_ci_approx"
+    field below; it's an approximation because bootstrap resampling here
+    is done at token granularity via block-level aggregates, not at exact
+    character offsets.
+
+    `block_stats`: list of {"tokens": int, "bits": float}, one per forward
+    window. Blocks (not individual tokens) are the resampling unit --
+    within a block, tokens share context and aren't independent draws, so
+    resampling at the block level is the more honest unit here.
+    """
+    if len(block_stats) < 10:
+        return {
+            "error": f"Need at least 10 blocks to bootstrap meaningfully; got "
+                     f"{len(block_stats)}. Use a longer eval text or a shorter "
+                     f"context_length (more, smaller blocks) if this keeps happening.",
+        }
+
+    rng = np.random.default_rng(seed)
+    n_blocks = len(block_stats)
+    bits = np.array([b["bits"] for b in block_stats])
+    tokens = np.array([b["tokens"] for b in block_stats])
+
+    point_bpt = bits.sum() / tokens.sum()
+
+    boot_bpts = np.empty(n_boot)
+    for i in range(n_boot):
+        idx = rng.integers(0, n_blocks, size=n_blocks)
+        boot_bpts[i] = bits[idx].sum() / tokens[idx].sum()
+
+    alpha = (1 - ci) / 2
+    lo, hi = np.quantile(boot_bpts, [alpha, 1 - alpha])
+
+    return {
+        "n_blocks": n_blocks,
+        "n_boot": n_boot,
+        "ci_level": ci,
+        "bits_per_token": round(float(point_bpt), 4),
+        "bits_per_token_ci_low": round(float(lo), 4),
+        "bits_per_token_ci_high": round(float(hi), 4),
+        "bits_per_token_ci_width": round(float(hi - lo), 4),
+    }
+
+
 # ─── Results Formatting ─────────────────────────────────────────────────────
 
 def format_results_table(results_dir: Path = None) -> str:

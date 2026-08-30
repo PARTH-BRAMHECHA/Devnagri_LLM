@@ -138,6 +138,67 @@ raising the LR back up.
   it's cached to `RESULTS_DIR/<lang>/llm_generated.txt` after the first run
   so repeated Stage 4 runs don't regenerate.
 
+## Known limitations (current Hindi-only results), and how to close them
+
+The Hindi results as of the last run are a clean pilot, not yet
+publication-ready for a venue like TALLIP. Multi-language (Marathi/Sanskrit)
+is **out of scope for now** and will be added later. The other four gaps
+now have code behind them:
+
+- **No variance / significance.**
+  Multi-seed infra already existed (`config.SEED`, stage2d's `--seed`,
+  `stage5_analysis.aggregate_seed_variance`) — see the loop in `config.py`'s
+  `SEED` docstring. What was missing was uncertainty *within* a single
+  seed's eval pass, which is now available via `--bootstrap-ci`:
+  ```bash
+  python run_pipeline.py --stage 3 --lang hindi --use-devaware-tokenizer --bootstrap-ci
+  ```
+  This attaches a `bootstrap_ci` block (bits-per-token, 95% CI) to every
+  LLM condition in `compression_results.json`, computed by resampling the
+  forward-pass windows already produced by the normal BPC pass — no extra
+  model calls. Report both this AND the multi-seed mean/std before calling
+  a BPC delta a real effect.
+
+- **Intrinsic metric only.**
+  New `pipeline/stage6_downstream.py` adds a downstream task: an XNLI
+  (Hindi NLI) linear probe on frozen last-hidden-state features, run once
+  with the DevAware tokenizer and once with the default tokenizer, same
+  fine-tuned model weights both times.
+  ```bash
+  python -m pipeline.stage6_downstream --lang hindi
+  ```
+  Writes `results/hindi/downstream_results.json` with per-condition
+  accuracy/macro-F1 and the accuracy delta. Like the BPC numbers, this is
+  one seed by default — pass `--seed` to probe a different Stage 2d
+  checkpoint and re-run before treating the delta as stable.
+
+- **No human eval on generated text.**
+  New `pipeline/human_eval.py` generates blinded, randomized-order sample
+  pairs (same fine-tuned model, tokenizer swapped) and produces a rating
+  sheet:
+  ```bash
+  python -m pipeline.human_eval --lang hindi --n-samples 20
+  # fill in results/hindi/human_eval_sheet.csv, then:
+  python -m pipeline.human_eval --lang hindi --aggregate
+  ```
+  Outputs `results/hindi/human_eval_results.json` with per-condition
+  fluency/coherence means and pass-as-human-written rate. The rater never
+  sees which condition produced which sample (`human_eval_key.json` holds
+  the mapping separately).
+
+- **Thin related-work baseline set.**
+  `config.BASELINE_TOKENIZERS` now includes four more current Indic
+  tokenizers/models (Sarvam, OpenHathi, Airavata's own tokenizer, Aya-101)
+  alongside the original IndicBERTv2/gpt2/Llama-2/Gemma set. Some are
+  gated on HF Hub — `stage2a_baselines.evaluate_hf_tokenizer` already
+  records `{"error": ...}` per-tokenizer on a load failure rather than
+  crashing the run, so re-run Stage 2 as usual:
+  ```bash
+  python run_pipeline.py --stage 2 --lang hindi
+  ```
+  and check `results/hindi/baseline_tokenizer_results.json` for any
+  `error` rows if a gated model needs `huggingface-cli login` first.
+
 ## Output layout
 
 ```

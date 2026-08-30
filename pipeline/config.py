@@ -86,11 +86,23 @@ CLASSICAL_COMPRESSORS = ["gzip", "bzip2", "zstd", "lzma"]
 ROUNDTRIP_TEST_SIZE = 500
 
 # ─── Baseline Tokenizers (for comparison) ────────────────────────────────────
+# Widened from 4 -> 8: the original list had only ONE Indic-specific
+# tokenizer (IndicBERTv2), so the vowel-split-% story was resting on a
+# single point of comparison. The four additions are all current Indic
+# LLMs/tokenizers; some are gated on HF (require `huggingface-cli login`
+# with an accepted license) -- evaluate_hf_tokenizer() in stage2a_baselines
+# already catches load failures per-tokenizer and records {"error": ...}
+# instead of crashing the whole run, so a missing gate just shows up as one
+# ERROR row rather than blocking the rest.
 BASELINE_TOKENIZERS = [
     "openai-community/gpt2",
     "meta-llama/Llama-2-7b-hf",
     "google/gemma-2b",
     "ai4bharat/IndicBERTv2-MLM-only",
+    "sarvamai/sarvam-1",
+    "sarvamai/OpenHathi-7B-Hi-v0.1-Base",
+    "ai4bharat/Airavata",              # the base model's OWN tokenizer, for reference
+    "CohereForAI/aya-101",
 ]
 
 # ─── Stage 2d: Vocabulary Extension + LoRA Fine-tune ────────────────────────

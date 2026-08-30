@@ -596,7 +596,8 @@ class LLMCompressor:
         return self.tokenizer.decode(token_ids, skip_special_tokens=True)
 
     @torch.no_grad()
-    def compute_bpc(self, text: str, context_length: int = None) -> dict:
+    def compute_bpc(self, text: str, context_length: int = None,
+                     track_blocks: bool = False) -> dict:
         """
         Compute bits-per-character (BPC) for a text without full compression.
 
@@ -619,6 +620,15 @@ class LLMCompressor:
         aligned" trade-off already accepted for _SlidingKVCache above), so
         BPC may differ very slightly from the old sequential number, but
         stays within noise for context_length >> average sentence length.
+
+        `track_blocks`: when True, also returns a "block_stats" list of
+        {"tokens": int, "bits": float} per forward-call window. This is
+        the resampling unit for a bootstrap CI (see
+        eval_utils.bootstrap_bpc_ci) -- it lets us quantify how much a
+        single fine-tune run's BPC could plausibly move on a *different*
+        draw of the same test set, WITHOUT paying for a second forward
+        pass over the corpus. Off by default since block_stats is extra
+        (small) memory/bookkeeping that normal runs don't need.
         """
         if context_length is None:
             context_length = LLM_CONTEXT_LENGTH
@@ -631,6 +641,7 @@ class LLMCompressor:
         total_bits = 0.0
         # First token: uniform → log2(vocab_size) bits
         total_bits += math.log2(self.vocab_size)
+        block_stats = [] if track_blocks else None
 
         t_start = time.time()
         n_predicted = 0
@@ -651,7 +662,10 @@ class LLMCompressor:
             targets = torch.tensor(window[1:], dtype=torch.long, device=self.device)
             token_log_probs = log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)
             token_log_probs = token_log_probs.clamp(min=math.log(1e-30))
-            total_bits += float((-token_log_probs / math.log(2)).sum().cpu())
+            block_bits = float((-token_log_probs / math.log(2)).sum().cpu())
+            total_bits += block_bits
+            if track_blocks:
+                block_stats.append({"tokens": len(window) - 1, "bits": block_bits})
 
             n_predicted += len(window) - 1
             block_start = block_end - 1  # next window starts where this one's predictions ended
@@ -666,7 +680,7 @@ class LLMCompressor:
         bpc = total_bits / text_chars
         bpb = total_bits / text_bytes
 
-        return {
+        result = {
             "total_bits": total_bits,
             "total_chars": text_chars,
             "total_bytes": text_bytes,
@@ -676,6 +690,9 @@ class LLMCompressor:
             "bits_per_token": round(total_bits / n_tokens, 4),
             "compression_ratio": round(text_bytes * 8 / max(total_bits, 1), 4),
         }
+        if track_blocks:
+            result["block_stats"] = block_stats
+        return result
 
     @torch.no_grad()
     def compute_bpc_sequential(self, text: str, context_length: int = None) -> dict:
@@ -853,12 +870,28 @@ def _warn_if_suspiciously_identical(baseline: dict, finetuned_default: dict, lan
               f"objects/weights before reporting this as a null result.\n")
 
 
+def _compute_bpc_with_ci(compressor: "LLMCompressor", text: str, bootstrap_ci: bool) -> dict:
+    """Wraps compute_bpc(); when bootstrap_ci is set, also attaches a
+    bootstrap CI (see eval_utils.bootstrap_bpc_ci) computed from the SAME
+    forward passes -- no extra model calls. block_stats itself is dropped
+    from the returned dict before it's written to disk (it's an internal,
+    fairly large list -- only the CI summary is worth keeping in the
+    results JSON)."""
+    from pipeline.eval_utils import bootstrap_bpc_ci
+    result = compressor.compute_bpc(text, track_blocks=bootstrap_ci)
+    if bootstrap_ci:
+        block_stats = result.pop("block_stats", [])
+        result["bootstrap_ci"] = bootstrap_bpc_ci(block_stats)
+    return result
+
+
 def run_compression(lang: str, verify: bool = False, classical_only: bool = False,
                      compressor: "LLMCompressor" = None,
                      devaware_compressor: "LLMCompressor" = None,
                      base_devaware_compressor: "LLMCompressor" = None,
                      precomputed_llm_result: dict = None,
-                     precomputed_base_devaware_result: dict = None):
+                     precomputed_base_devaware_result: dict = None,
+                     bootstrap_ci: bool = False):
     """
     Run compression pipeline for a language.
 
@@ -985,7 +1018,7 @@ def run_compression(lang: str, verify: bool = False, classical_only: bool = Fals
 
             # Compute BPC on sample
             print(f"  Computing BPC on {len(test_sample):,} chars...")
-            llm_result = compressor.compute_bpc(test_sample)
+            llm_result = _compute_bpc_with_ci(compressor, test_sample, bootstrap_ci)
 
         results["llm_compression"] = {
             "model": INDIC_LLM_MODEL,
@@ -1005,7 +1038,7 @@ def run_compression(lang: str, verify: bool = False, classical_only: bool = Fals
         print(f"\n  --- LLM Compression (DevAware tokenizer, fine-tuned) ---")
         try:
             print(f"  Computing BPC on {len(test_sample):,} chars...")
-            dev_result = devaware_compressor.compute_bpc(test_sample)
+            dev_result = _compute_bpc_with_ci(devaware_compressor, test_sample, bootstrap_ci)
             results["llm_compression_devaware_tokenizer"] = {
                 "model": f"{INDIC_LLM_MODEL} (vocab-extended, LoRA fine-tuned)",
                 "tokenizer": "devaware",
@@ -1030,7 +1063,7 @@ def run_compression(lang: str, verify: bool = False, classical_only: bool = Fals
                 base_dev_result = precomputed_base_devaware_result
             else:
                 print(f"  Computing BPC on {len(test_sample):,} chars...")
-                base_dev_result = base_devaware_compressor.compute_bpc(test_sample)
+                base_dev_result = _compute_bpc_with_ci(base_devaware_compressor, test_sample, bootstrap_ci)
             results["llm_compression_base_devaware_tokenizer"] = {
                 "model": f"{INDIC_LLM_MODEL} (vocab-extended, smart-init, NOT fine-tuned)",
                 "tokenizer": "devaware",
@@ -1058,7 +1091,7 @@ def run_compression(lang: str, verify: bool = False, classical_only: bool = Fals
                 model=devaware_compressor.model,
             )
             print(f"  Computing BPC on {len(test_sample):,} chars...")
-            ft_default_result = finetuned_default.compute_bpc(test_sample)
+            ft_default_result = _compute_bpc_with_ci(finetuned_default, test_sample, bootstrap_ci)
             results["llm_compression_finetuned_default_tokenizer"] = {
                 "model": f"{INDIC_LLM_MODEL} (vocab-extended, LoRA fine-tuned)",
                 "tokenizer": "model_default",
@@ -1111,6 +1144,13 @@ def main():
                         help="Run lossless round-trip verification")
     parser.add_argument("--classical-only", action="store_true",
                         help="Only run classical compressors (skip LLM)")
+    parser.add_argument("--bootstrap-ci", action="store_true",
+                        help="Attach a bootstrap CI on bits-per-token to each "
+                             "LLM condition, computed from the same forward "
+                             "passes (no extra model calls). Complements "
+                             "multi-seed variance (see config.SEED) -- this "
+                             "quantifies uncertainty from the test set at a "
+                             "FIXED seed, not across fine-tune runs.")
     args = parser.parse_args()
 
     langs = LANGUAGES if args.lang == "all" else [args.lang]
@@ -1126,7 +1166,7 @@ def main():
         print(f"  COMPRESSION: {lang.upper()}")
         print(f"{'='*60}")
         run_compression(lang, verify=args.verify, classical_only=args.classical_only,
-                         compressor=shared_compressor)
+                         compressor=shared_compressor, bootstrap_ci=args.bootstrap_ci)
 
     print("\n✓ Stage 3 (Compression) complete.")
 

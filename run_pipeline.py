@@ -120,6 +120,7 @@ def run_stage_2d(lang: str = "all"):
 
 
 def run_stage_3(lang: str = "all", classical_only: bool = False, verify: bool = False,
+                 bootstrap_ci: bool = False,
                  use_devaware_tokenizer: bool = False):
     """Stage 3: Compression Pipeline
 
@@ -214,7 +215,8 @@ def run_stage_3(lang: str = "all", classical_only: bool = False, verify: bool = 
                          devaware_compressor=devaware_compressor,
                          base_devaware_compressor=base_devaware_compressor,
                          precomputed_llm_result=precomputed_llm_result,
-                         precomputed_base_devaware_result=precomputed_base_devaware_result)
+                         precomputed_base_devaware_result=precomputed_base_devaware_result,
+                         bootstrap_ci=bootstrap_ci)
 
         # Detach the adapter / restore the shared base model's original
         # embeddings before the next language, so we never hold two full
@@ -419,6 +421,14 @@ Examples:
              "using Stage 2d's vocab-extended, fine-tuned model. Requires "
              "`--stage 2d` to have been run for the target language(s) first.",
     )
+    parser.add_argument(
+        "--bootstrap-ci",
+        action="store_true",
+        help="In Stage 3, attach a bootstrap CI on bits-per-token to each LLM "
+             "condition (from the same forward passes -- no extra model calls). "
+             "Complements multi-seed variance (config.SEED): quantifies "
+             "test-set uncertainty at a fixed seed, not across fine-tune runs.",
+    )
     args = parser.parse_args()
 
     ensure_dirs()
@@ -442,6 +452,7 @@ Examples:
         elif stage == "3":
             llm_compressor = run_stage_3(
                 args.lang, args.classical_only, args.verify,
+                bootstrap_ci=args.bootstrap_ci,
                 use_devaware_tokenizer=args.use_devaware_tokenizer,
             )
         elif stage == "4":
