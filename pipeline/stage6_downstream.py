@@ -58,28 +58,50 @@ def _results_filename(suffix: str = "") -> str:
 
 
 @torch.no_grad()
-def _embed(model, tokenizer, premise: str, hypothesis: str, device: str) -> np.ndarray:
-    """Mean-pool the final hidden state over premise+hypothesis, encoded as
-    a single sequence (standard NLI-as-one-sequence framing)."""
+def _embed(model, tokenizer, premise: str, hypothesis: str, device: str,
+           pooling: str = "last") -> np.ndarray:
+    """Encode premise+hypothesis as a single sequence and pool the final
+    hidden state into one vector.
+
+    `pooling`:
+      - "last" (default): the last non-padded token's hidden state. This
+        is the standard choice for a DECODER-ONLY (causal) model -- only
+        the final token's hidden state has attended to the full sequence;
+        every earlier token's state was computed under a causal mask that
+        blocks it from seeing anything after it, so those earlier states
+        carry an incomplete (and for a premise-then-hypothesis sequence,
+        premise-ONLY) view of the pair being classified.
+      - "mean": mean-pool over all tokens (the original implementation).
+        This is a bidirectional-encoder (BERT-style) convention that
+        implicitly assumes every token's representation already reflects
+        the whole sequence -- not true here, and averaging in a large
+        block of premise-only states is closer to diluting the signal
+        with noise than aggregating complementary views of it. Kept as an
+        option only to A/B against "last", not as a recommended default.
+    """
     sep = tokenizer.sep_token or tokenizer.eos_token or "[SEP]"
     text = f"{premise} {sep} {hypothesis}"
     enc = tokenizer(text, return_tensors="pt", truncation=True,
                      max_length=MAX_SEQ_LEN).to(device)
     out = model(**enc, output_hidden_states=True)
     last_hidden = out.hidden_states[-1][0]  # (seq_len, hidden)
+    if pooling == "last":
+        return last_hidden[-1].float().cpu().numpy()
     return last_hidden.mean(dim=0).float().cpu().numpy()
 
 
-def _build_features(model, tokenizer, examples, device: str, desc: str = ""):
+def _build_features(model, tokenizer, examples, device: str, desc: str = "",
+                     pooling: str = "last"):
     feats, labels = [], []
     for ex in tqdm(examples, desc=desc):
-        feats.append(_embed(model, tokenizer, ex["premise"], ex["hypothesis"], device))
+        feats.append(_embed(model, tokenizer, ex["premise"], ex["hypothesis"], device, pooling))
         labels.append(ex["label"])
     return np.stack(feats), np.array(labels)
 
 
 def run_downstream(lang: str, seed: int = None, device: str = None,
-                    n_train: int = DOWNSTREAM_TRAIN_CAP, n_eval: int = DOWNSTREAM_EVAL_CAP):
+                    n_train: int = DOWNSTREAM_TRAIN_CAP, n_eval: int = DOWNSTREAM_EVAL_CAP,
+                    pooling: str = "last"):
     if lang not in XNLI_LANG_CODE:
         print(f"  ⚠ No downstream task wired up for '{lang}' yet -- XNLI only "
               f"covers {list(XNLI_LANG_CODE)}. Skipping.")
@@ -99,7 +121,7 @@ def run_downstream(lang: str, seed: int = None, device: str = None,
     run_seed = seed if seed is not None else SEED
 
     print(f"\n{'='*70}")
-    print(f"  STAGE 6: DOWNSTREAM TASK EVAL ({lang}, XNLI-{lang_code})")
+    print(f"  STAGE 6: DOWNSTREAM TASK EVAL ({lang}, XNLI-{lang_code}, pooling={pooling})")
     print(f"{'='*70}")
 
     ds = load_dataset("facebook/xnli", lang_code)
@@ -127,10 +149,12 @@ def run_downstream(lang: str, seed: int = None, device: str = None,
         print(f"\n  --- Condition: {cond_name} ---")
         t0 = time.time()
         X_train, y_train = _build_features(
-            model, tok, train_examples, device, desc=f"  embed train ({cond_name})"
+            model, tok, train_examples, device, desc=f"  embed train ({cond_name})",
+            pooling=pooling
         )
         X_eval, y_eval = _build_features(
-            model, tok, eval_examples, device, desc=f"  embed eval ({cond_name})"
+            model, tok, eval_examples, device, desc=f"  embed eval ({cond_name})",
+            pooling=pooling
         )
 
         probe = LogisticRegression(max_iter=2000)
@@ -141,6 +165,7 @@ def run_downstream(lang: str, seed: int = None, device: str = None,
 
         results[cond_name] = {
             "task": f"xnli-{lang_code}",
+            "pooling": pooling,
             "n_train": len(train_examples),
             "n_eval": len(eval_examples),
             "accuracy": round(float(acc), 4),
@@ -154,14 +179,18 @@ def run_downstream(lang: str, seed: int = None, device: str = None,
     results["_meta"] = {
         "model": f"{INDIC_LLM_MODEL} (vocab-extended, LoRA fine-tuned)",
         "seed": run_seed,
-        "probe": "sklearn LogisticRegression on mean-pooled frozen last-hidden-state",
+        "pooling": pooling,
+        "probe": f"sklearn LogisticRegression on {pooling}-pooled frozen last-hidden-state",
         "accuracy_delta_devaware_minus_default": round(dev_acc - def_acc, 4),
         "note": (
             "Same fine-tuned model weights for both conditions -- only the "
             "tokenizer changes. A single run at one seed; treat like the BPC "
             "numbers in compression_results.json and re-run at 2-3 seeds "
             "(config.SEED workflow) before reporting this delta as a stable "
-            "effect rather than noise."
+            "effect rather than noise. If accuracy is still near the 33% "
+            "chance baseline for 3-way XNLI even with pooling='last', that's "
+            "evidence the frozen-representation probe isn't capturing the "
+            "task -- not that the two tokenizer conditions are equivalent."
         ),
     }
 
@@ -180,13 +209,22 @@ def main():
                               "(default: config.SEED)")
     parser.add_argument("--n-train", type=int, default=DOWNSTREAM_TRAIN_CAP)
     parser.add_argument("--n-eval", type=int, default=DOWNSTREAM_EVAL_CAP)
+    parser.add_argument("--pooling", choices=["last", "mean"], default="last",
+                         help="How to pool the final hidden state into one "
+                              "probe feature vector. 'last' (default) is the "
+                              "standard choice for a decoder-only/causal "
+                              "model -- only the last token has attended to "
+                              "the full premise+hypothesis sequence. 'mean' "
+                              "is the original (BERT-style) implementation, "
+                              "kept for A/B comparison.")
     args = parser.parse_args()
 
     langs = LANGUAGES if args.lang == "all" else [args.lang]
     for lang in langs:
         try:
             run_with_diagnostics(
-                run_downstream, lang, seed=args.seed, n_train=args.n_train, n_eval=args.n_eval
+                run_downstream, lang, seed=args.seed, n_train=args.n_train,
+                n_eval=args.n_eval, pooling=args.pooling
             )
         except FileNotFoundError as e:
             print(f"  ⚠ Skipping {lang}: {e}")
