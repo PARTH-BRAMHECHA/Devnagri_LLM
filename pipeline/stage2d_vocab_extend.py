@@ -998,7 +998,23 @@ def load_finetuned_devaware_model(lang: str, device: str = None, merge_lora: boo
         (torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16)
         if device == "cuda" else torch.float32
     )
-    model = model.to(device=device, dtype=target_dtype).eval()
+    # A bitsandbytes-quantized base model (Stage 3's shared 4-bit compressor,
+    # passed in as `base_model` above) already sits on `device` with a fixed
+    # compute dtype set at quantization time (see stage3_compress.py's
+    # bnb_4bit_compute_dtype=model_dtype). transformers refuses .to(dtype=...)
+    # on it even after merge_and_unload(), because the top-level model object
+    # still carries its quantization metadata regardless of which individual
+    # layers got merged:
+    #   ValueError: You cannot cast a bitsandbytes model in a new `dtype`.
+    # Casting is therefore neither possible nor necessary in that case --
+    # only force the uniform dtype on unquantized models.
+    is_quantized = getattr(model, "is_loaded_in_4bit", False) or \
+        getattr(model, "is_loaded_in_8bit", False) or \
+        getattr(model, "is_quantized", False)
+    if is_quantized:
+        model = model.eval()
+    else:
+        model = model.to(device=device, dtype=target_dtype).eval()
     return model, tokenizer
 
 
