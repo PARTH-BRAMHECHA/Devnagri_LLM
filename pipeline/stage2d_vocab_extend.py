@@ -980,7 +980,25 @@ def load_finetuned_devaware_model(lang: str, device: str = None, merge_lora: boo
     if merge_lora:
         model = model.merge_and_unload()  # fold LoRA weights into base for faster inference
 
-    model = model.to(device).eval()
+    # Force a single, uniform dtype across every submodule before
+    # returning. resize_token_embeddings()/PEFT's modules_to_save handling
+    # can leave the embed_tokens/lm_head rows in float32 while the rest of
+    # the (bf16-loaded) base model stays bfloat16 -- harmless for Stage 3's
+    # compute_bpc() path (its forward pass apparently never routes through
+    # the mismatched pair in a way that surfaces it), but a hard crash for
+    # any full forward pass that does, e.g.:
+    #   RuntimeError: expected mat1 and mat2 to have the same dtype,
+    #   but got: float != c10::BFloat16
+    # at self_attn.q_proj -- exactly what stage6_downstream.py's and
+    # human_eval.py's model(**enc, output_hidden_states=True) / .generate()
+    # calls hit. Mirrors LLMCompressor's own dtype selection (stage3) so
+    # every caller gets a consistently-typed model regardless of which
+    # internal resize/merge path was taken.
+    target_dtype = (
+        (torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16)
+        if device == "cuda" else torch.float32
+    )
+    model = model.to(device=device, dtype=target_dtype).eval()
     return model, tokenizer
 
 
