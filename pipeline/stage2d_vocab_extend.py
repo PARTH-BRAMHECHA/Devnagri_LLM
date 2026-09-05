@@ -662,19 +662,45 @@ def _prune_old_checkpoints(save_dir: Path, keep_step: int, keep_last_n: int = 1)
 def _save_checkpoint(model, tokenizer, save_dir: Path, step: int,
                       final: bool = False, optimizer=None):
     out_dir = save_dir / ("final" if final else f"step_{step}")
+
+    # Prune BEFORE writing the new checkpoint, not just after. Writing
+    # step_N while step_(N-1) (model + resized embed/head + optimizer.pt,
+    # easily several GB with a resized vocab) still sits on disk means two
+    # full checkpoints exist at once for the duration of the write. That
+    # transient 2x peak -- not steady-state usage -- is what blows a
+    # Kaggle 20GB /kaggle/working quota and crashes save_pretrained with
+    # "No space left on device" (os error 28), even though post-write
+    # pruning would have brought usage back down to 1x afterwards.
+    if not final:
+        _prune_old_checkpoints(save_dir, keep_step=step, keep_last_n=1)
+
     out_dir.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(out_dir)   # saves LoRA adapter + resized embed/head
-    tokenizer.save_pretrained(out_dir)
-    if optimizer is not None:
-        # Not saved for 'final' -- nothing resumes past a completed run,
-        # no need to carry Adam state around after training is done.
-        torch.save(optimizer.state_dict(), out_dir / "optimizer.pt")
+    try:
+        model.save_pretrained(out_dir)   # saves LoRA adapter + resized embed/head
+        tokenizer.save_pretrained(out_dir)
+        if optimizer is not None:
+            # Not saved for 'final' -- nothing resumes past a completed run,
+            # no need to carry Adam state around after training is done.
+            torch.save(optimizer.state_dict(), out_dir / "optimizer.pt")
+    except OSError as e:
+        # Most likely still ENOSPC (e.g. pre-prune wasn't enough headroom,
+        # or something else on disk grew mid-run). Clean up the partial
+        # write so a half-finished checkpoint can never be mistaken for a
+        # resumable one by _find_latest_checkpoint, then re-raise so the
+        # caller's existing OOM/wall-clock handling still applies.
+        shutil.rmtree(out_dir, ignore_errors=True)
+        free_gb = shutil.disk_usage(save_dir).free / (1024 ** 3)
+        print(f"  ✗ Failed to save checkpoint at step {step}: {e} "
+              f"({free_gb:.2f} GB free on {save_dir}). Removed partial "
+              f"write at {out_dir}.")
+        raise
+
     print(f"  ✓ Checkpoint saved: {out_dir}")
 
-    # Only periodic step_N checkpoints accumulate across a run; 'final' is
-    # a single one-off write and needs no pruning. Keep just the checkpoint
-    # we just wrote -- resume only ever reads the single highest step_N dir
-    # (see _find_latest_checkpoint), so nothing older is ever read again.
+    # Belt-and-suspenders: also prune after, in case the pre-write prune
+    # above found nothing to delete (e.g. this is the very first
+    # checkpoint of the run) but something else left stale step_N dirs
+    # around from an earlier crashed attempt.
     if not final:
         _prune_old_checkpoints(save_dir, keep_step=step, keep_last_n=1)
 
