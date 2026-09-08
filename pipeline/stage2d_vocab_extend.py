@@ -659,6 +659,51 @@ def _prune_old_checkpoints(save_dir: Path, keep_step: int, keep_last_n: int = 1)
             print(f"  ⚠ Could not prune {d}: {e}")
 
 
+def _prune_incomplete_sibling_dirs(save_dir: Path, min_free_gb: float = 8.0):
+    """Free disk from OTHER seed/lang checkpoint trees that share the same
+    Kaggle quota with `save_dir`, if free space is getting tight.
+
+    ROOT CAUSE: `_prune_old_checkpoints` only ever prunes step_N/ dirs
+    INSIDE the save_dir it's called with (e.g. only within
+    devaware_finetuned/hindi/seed_1/). It has no visibility into sibling
+    directories like devaware_finetuned/hindi/seed_0/, which is a
+    completely separate save_dir/call chain. If seed_0's run stops (hits
+    its round budget, or crashes) before reaching a `final` checkpoint,
+    its last step_N/ dir -- a full LoRA adapter + resized embed/head +
+    optimizer.pt, easily several GB -- is never pruned by anything, since
+    nothing ever calls _save_checkpoint for seed_0 again in that run. It
+    just sits on disk. When seed_1 later tries to write ITS OWN new
+    checkpoint, the two together can exceed the shared 20GB
+    /kaggle/working quota even though each seed's own pruning worked
+    correctly in isolation -- this is what crashed seed_1 above.
+
+    This only prunes step_N/ dirs, never `final/` (a completed result),
+    and only acts when free space is actually low, so it's a no-op in the
+    common case where there's plenty of room.
+    """
+    devaware_root = save_dir.parents[1] if save_dir.parent.name.startswith("seed_") \
+        else save_dir.parent
+    if not devaware_root.exists():
+        return
+    free_gb = shutil.disk_usage(devaware_root).free / (1024 ** 3)
+    if free_gb >= min_free_gb:
+        return
+    print(f"  ⚠ Only {free_gb:.2f} GB free -- scanning sibling checkpoint "
+          f"dirs under {devaware_root} for prunable step_N/ dirs...")
+    for lang_dir in devaware_root.iterdir():
+        if not lang_dir.is_dir():
+            continue
+        for candidate_dir in [lang_dir, *[d for d in lang_dir.glob("seed_*") if d.is_dir()]]:
+            if candidate_dir == save_dir:
+                continue  # this run's own dir: leave to the normal keep_last_n=1 logic
+            for step_dir in sorted(candidate_dir.glob("step_*")):
+                print(f"  [cross-seed prune] {step_dir} (freeing space for {save_dir})")
+                shutil.rmtree(step_dir, ignore_errors=True)
+            free_gb = shutil.disk_usage(devaware_root).free / (1024 ** 3)
+            if free_gb >= min_free_gb:
+                return
+
+
 def _save_checkpoint(model, tokenizer, save_dir: Path, step: int,
                       final: bool = False, optimizer=None):
     out_dir = save_dir / ("final" if final else f"step_{step}")
@@ -674,6 +719,10 @@ def _save_checkpoint(model, tokenizer, save_dir: Path, step: int,
     if not final:
         _prune_old_checkpoints(save_dir, keep_step=step, keep_last_n=1)
 
+    # FIX: also free space from unrelated seed/lang checkpoint dirs if
+    # we're still low after pruning our own -- see docstring above.
+    _prune_incomplete_sibling_dirs(save_dir)
+
     out_dir.mkdir(parents=True, exist_ok=True)
     try:
         model.save_pretrained(out_dir)   # saves LoRA adapter + resized embed/head
@@ -682,15 +731,28 @@ def _save_checkpoint(model, tokenizer, save_dir: Path, step: int,
             # Not saved for 'final' -- nothing resumes past a completed run,
             # no need to carry Adam state around after training is done.
             torch.save(optimizer.state_dict(), out_dir / "optimizer.pt")
-    except OSError as e:
+    except Exception as e:
+        # FIX: was `except OSError` only. safetensors raises
+        # safetensors._safetensors_rust.SafetensorError for "No space left
+        # on device" (os error 28) -- a Rust-side error, NOT a subclass of
+        # OSError -- so the disk-full case this handler exists for was
+        # silently NOT caught here, and propagated uncaught to the caller
+        # instead of getting this cleanup + clear message. Catching
+        # Exception (and unconditionally re-raising below, same as before)
+        # makes this a catch-all cleanup step regardless of error type,
+        # while still surfacing the real failure to the caller.
+        #
         # Most likely still ENOSPC (e.g. pre-prune wasn't enough headroom,
-        # or something else on disk grew mid-run). Clean up the partial
-        # write so a half-finished checkpoint can never be mistaken for a
-        # resumable one by _find_latest_checkpoint, then re-raise so the
-        # caller's existing OOM/wall-clock handling still applies.
+        # or something else on disk grew mid-run -- see
+        # _prune_incomplete_sibling_dirs below for the cross-seed case).
+        # Clean up the partial write so a half-finished checkpoint can
+        # never be mistaken for a resumable one by _find_latest_checkpoint,
+        # then re-raise so the caller's existing OOM/wall-clock handling
+        # still applies.
         shutil.rmtree(out_dir, ignore_errors=True)
         free_gb = shutil.disk_usage(save_dir).free / (1024 ** 3)
-        print(f"  ✗ Failed to save checkpoint at step {step}: {e} "
+        print(f"  ✗ Failed to save checkpoint at step {step}: "
+              f"{type(e).__name__}: {e} "
               f"({free_gb:.2f} GB free on {save_dir}). Removed partial "
               f"write at {out_dir}.")
         raise
