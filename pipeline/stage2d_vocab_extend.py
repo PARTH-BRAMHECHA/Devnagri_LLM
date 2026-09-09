@@ -716,8 +716,19 @@ def _save_checkpoint(model, tokenizer, save_dir: Path, step: int,
     # Kaggle 20GB /kaggle/working quota and crashes save_pretrained with
     # "No space left on device" (os error 28), even though post-write
     # pruning would have brought usage back down to 1x afterwards.
+    #
+    # FIX: this call previously passed keep_last_n=1, which was a silent
+    # no-op in the normal steady state. _prune_old_checkpoints only sees
+    # checkpoints that ALREADY exist on disk -- at this point step_N
+    # hasn't been written yet, so with exactly one prior checkpoint
+    # (step_(N-1)) present, candidates[:-1] == [] and nothing was ever
+    # deleted here. step_(N-1) then sat on disk for the entire step_N
+    # write, recreating the exact 2x peak this call was meant to prevent.
+    # keep_last_n=0 deletes every existing step_N dir pre-write, since
+    # none of them are "the newest" yet -- that title only exists after
+    # the write below succeeds.
     if not final:
-        _prune_old_checkpoints(save_dir, keep_step=step, keep_last_n=1)
+        _prune_old_checkpoints(save_dir, keep_step=step, keep_last_n=0)
 
     # FIX: also free space from unrelated seed/lang checkpoint dirs if
     # we're still low after pruning our own -- see docstring above.
@@ -759,10 +770,11 @@ def _save_checkpoint(model, tokenizer, save_dir: Path, step: int,
 
     print(f"  ✓ Checkpoint saved: {out_dir}")
 
-    # Belt-and-suspenders: also prune after, in case the pre-write prune
-    # above found nothing to delete (e.g. this is the very first
-    # checkpoint of the run) but something else left stale step_N dirs
-    # around from an earlier crashed attempt.
+    # Belt-and-suspenders: also prune after. keep_last_n=1 is correct
+    # here (unlike the pre-write call above) -- the new checkpoint now
+    # exists on disk alongside anything stale left from an earlier
+    # crashed attempt, so "keep the 1 most recent" correctly keeps the
+    # checkpoint just written and removes everything else.
     if not final:
         _prune_old_checkpoints(save_dir, keep_step=step, keep_last_n=1)
 
