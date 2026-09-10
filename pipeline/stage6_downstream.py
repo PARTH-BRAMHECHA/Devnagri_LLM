@@ -368,6 +368,137 @@ def run_downstream_multiseed(lang: str, seeds, device: str = None,
     return results
 
 
+# ---------------------------------------------------------------------------
+# Per-seed compute + save, and aggregate-from-saved (new): decouples
+# "compute this seed's downstream numbers" (needs the Stage 2d checkpoint
+# loaded -- GPU time, ~1h) from "combine N seeds into a reported
+# mean/std/CI" (aggregate_downstream_from_saved below -- just reads small
+# saved json files, no checkpoint needed). run_downstream_multiseed above
+# requires every requested seed's checkpoint to be present in the SAME
+# process run, which makes it incompatible with freeing a seed's
+# checkpoint to disk space right after computing its numbers -- there'd be
+# no way to later fold another seed into a correct combined CI without
+# reloading the freed seeds' checkpoints (i.e. retraining them). This pair
+# of functions is the fix: call run_downstream_one_seed_and_save once per
+# seed (checkpoint required, right before you free that seed), then call
+# aggregate_downstream_from_saved whenever you want the combined result --
+# even long after some seeds' checkpoints are gone.
+# ---------------------------------------------------------------------------
+
+def run_downstream_one_seed_and_save(lang, seed, device=None,
+                                      n_train=DOWNSTREAM_TRAIN_CAP,
+                                      n_eval=DOWNSTREAM_EVAL_CAP,
+                                      pooling="last"):
+    """Run the downstream probe for exactly ONE seed and persist the small
+    result (accuracy/macro_f1 per tokenizer condition -- no model weights)
+    to results/<lang>/downstream_per_seed/seed_<N>.json. Returns None
+    without writing anything if `lang` has no downstream task wired up
+    (see XNLI_LANG_CODE) -- safe to call unconditionally per-seed from a
+    generic multi-language driver.
+    """
+    if lang not in XNLI_LANG_CODE:
+        print(f"  ⚠ No downstream task wired up for '{lang}' yet. Skipping "
+              f"(seed={seed} training-loss numbers are unaffected).")
+        return None
+
+    ensure_dirs()
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    lang_code = XNLI_LANG_CODE[lang]
+
+    print(f"\n{'='*70}")
+    print(f"  STAGE 6 (single seed, save-only): {lang}, XNLI-{lang_code}, "
+          f"seed={seed}, pooling={pooling}")
+    print(f"{'='*70}")
+
+    seed_result = _run_one_seed(lang, lang_code, seed, device, n_train, n_eval, pooling)
+
+    per_seed_dir = RESULTS_DIR / lang / "downstream_per_seed"
+    per_seed_dir.mkdir(parents=True, exist_ok=True)
+    out_path = per_seed_dir / f"seed_{seed}.json"
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(seed_result, f, indent=2, ensure_ascii=False)
+
+    print(f"\n  ✓ Saved per-seed downstream result: {out_path}")
+    return seed_result
+
+
+def aggregate_downstream_from_saved(lang, seeds, n_train=DOWNSTREAM_TRAIN_CAP,
+                                     n_eval=DOWNSTREAM_EVAL_CAP, pooling="last"):
+    """Combine already-saved per-seed downstream results (written by
+    run_downstream_one_seed_and_save) into the same
+    downstream_results_multiseed.json shape that run_downstream_multiseed
+    produces -- WITHOUT reloading any Stage 2d checkpoint. Lets you add a
+    new seed's number and recombine with earlier seeds' numbers even after
+    those earlier seeds' checkpoints have been deleted, as long as each
+    seed's per-seed json was saved first via run_downstream_one_seed_and_save.
+    """
+    per_seed_dir = RESULTS_DIR / lang / "downstream_per_seed"
+    per_seed = {"devaware_tokenizer": [], "default_tokenizer": []}
+    missing = []
+    for seed in seeds:
+        path = per_seed_dir / f"seed_{seed}.json"
+        if not path.exists():
+            missing.append(seed)
+            continue
+        with open(path, "r", encoding="utf-8") as f:
+            seed_result = json.load(f)
+        for cond in per_seed:
+            per_seed[cond].append(seed_result[cond])
+
+    if missing:
+        raise FileNotFoundError(
+            f"No saved per-seed downstream result for {lang} seed(s) "
+            f"{missing} under {per_seed_dir}. Run "
+            "run_downstream_one_seed_and_save(lang, seed) for each missing "
+            "seed first (needs that seed's Stage 2d checkpoint to still "
+            "exist), THEN aggregate."
+        )
+
+    results = {}
+    for cond in per_seed:
+        accs = [r["accuracy"] for r in per_seed[cond]]
+        f1s = [r["macro_f1"] for r in per_seed[cond]]
+        results[cond] = {
+            "pooling": pooling,
+            "n_train": n_train,
+            "n_eval": n_eval,
+            "per_seed": per_seed[cond],
+            "accuracy_mean": float(np.mean(accs)),
+            "accuracy_std": float(np.std(accs)),
+            "accuracy_ci95": bootstrap_ci(accs),
+            "macro_f1_mean": float(np.mean(f1s)),
+            "macro_f1_std": float(np.std(f1s)),
+            "macro_f1_ci95": bootstrap_ci(f1s),
+        }
+
+    dev_ci = results["devaware_tokenizer"]["accuracy_ci95"]
+    def_ci = results["default_tokenizer"]["accuracy_ci95"]
+    ci_overlap = not (dev_ci[1] < def_ci[0] or def_ci[1] < dev_ci[0])
+    delta = results["devaware_tokenizer"]["accuracy_mean"] - results["default_tokenizer"]["accuracy_mean"]
+
+    results["_meta"] = {
+        "seeds": list(seeds),
+        "accuracy_delta_devaware_minus_default": round(float(delta), 4),
+        "ci95_overlap": ci_overlap,
+        "aggregated_from_saved_per_seed_results": True,
+        "note": (
+            "CIs computed via bootstrap over per-seed accuracies, "
+            "aggregated from saved per-seed results (no checkpoint "
+            "reload needed). If ci95_overlap is True, the delta is not "
+            "distinguishable from noise at this seed count -- do not "
+            "report a winner."
+        ),
+    }
+
+    out_path = RESULTS_DIR / lang / "downstream_results_multiseed.json"
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+
+    print(f"\n  ✓ Saved (aggregated from {len(seeds)} saved seed(s)): {out_path}")
+    print(f"  delta={delta:+.4f}  CI overlap={ci_overlap}")
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(description="Stage 6: downstream task eval (XNLI probe)")
     parser.add_argument("--lang", choices=LANGUAGES + ["all"], default="hindi")
@@ -377,8 +508,28 @@ def main():
                               "exclusive with --seeds.")
     parser.add_argument("--seeds", type=int, nargs="+", default=None,
                          help="Multi-seed mode: run each seed, aggregate with "
-                              "a bootstrap 95%% CI and a C-sweep. Overrides "
-                              "--seed if both are given.")
+                              "a bootstrap 95%% CI and a C-sweep. Requires "
+                              "every seed's checkpoint to be present at once "
+                              "-- if you've freed any seed's checkpoint to "
+                              "save disk, use --seed-and-save / "
+                              "--aggregate-seeds instead. Overrides --seed "
+                              "if both are given.")
+    parser.add_argument("--seed-and-save", type=int, default=None, metavar="SEED",
+                         help="Run ONE seed's downstream probe and save its "
+                              "small result to "
+                              "results/<lang>/downstream_per_seed/seed_<N>.json "
+                              "without aggregating. Needs that seed's Stage 2d "
+                              "checkpoint. Use this right before freeing "
+                              "(deleting) that checkpoint to disk-space-save "
+                              "the number that matters before the weights go.")
+    parser.add_argument("--aggregate-seeds", type=int, nargs="+", default=None,
+                         metavar="SEED",
+                         help="Combine already-saved per-seed results (from "
+                              "prior --seed-and-save runs) into "
+                              "downstream_results_multiseed.json. No "
+                              "checkpoint is loaded -- safe to run even after "
+                              "those seeds' Stage 2d checkpoints have been "
+                              "deleted.")
     parser.add_argument("--n-train", type=int, default=DOWNSTREAM_TRAIN_CAP)
     parser.add_argument("--n-eval", type=int, default=DOWNSTREAM_EVAL_CAP)
     parser.add_argument("--pooling", choices=["last", "mean"], default="last",
@@ -394,7 +545,17 @@ def main():
     langs = LANGUAGES if args.lang == "all" else [args.lang]
     for lang in langs:
         try:
-            if args.seeds:
+            if args.seed_and_save is not None:
+                run_with_diagnostics(
+                    run_downstream_one_seed_and_save, lang, seed=args.seed_and_save,
+                    n_train=args.n_train, n_eval=args.n_eval, pooling=args.pooling
+                )
+            elif args.aggregate_seeds:
+                run_with_diagnostics(
+                    aggregate_downstream_from_saved, lang, seeds=args.aggregate_seeds,
+                    n_train=args.n_train, n_eval=args.n_eval, pooling=args.pooling
+                )
+            elif args.seeds:
                 run_with_diagnostics(
                     run_downstream_multiseed, lang, seeds=args.seeds,
                     n_train=args.n_train, n_eval=args.n_eval, pooling=args.pooling
