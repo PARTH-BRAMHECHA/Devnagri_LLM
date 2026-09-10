@@ -727,8 +727,16 @@ def _save_checkpoint(model, tokenizer, save_dir: Path, step: int,
     # keep_last_n=0 deletes every existing step_N dir pre-write, since
     # none of them are "the newest" yet -- that title only exists after
     # the write below succeeds.
-    if not final:
-        _prune_old_checkpoints(save_dir, keep_step=step, keep_last_n=0)
+    #
+    # FIX 2: this was previously gated on `if not final:`, which skipped
+    # it entirely on the final checkpoint save -- the one save where it
+    # matters most. That left the last periodic step_N checkpoint (with
+    # its optimizer.pt, often 1-3GB) sitting on disk for the whole
+    # duration of the final write, recreating the exact 2x-peak blowup
+    # this call exists to prevent. A step_N/ dir is always safe to
+    # delete before writing either the next step_N/ or final/, so this
+    # now runs unconditionally.
+    _prune_old_checkpoints(save_dir, keep_step=step, keep_last_n=0)
 
     # FIX: also free space from unrelated seed/lang checkpoint dirs if
     # we're still low after pruning our own -- see docstring above.
@@ -775,8 +783,13 @@ def _save_checkpoint(model, tokenizer, save_dir: Path, step: int,
     # exists on disk alongside anything stale left from an earlier
     # crashed attempt, so "keep the 1 most recent" correctly keeps the
     # checkpoint just written and removes everything else.
-    if not final:
-        _prune_old_checkpoints(save_dir, keep_step=step, keep_last_n=1)
+    #
+    # FIX: also previously gated on `if not final:`. Once final/ exists,
+    # every step_N/ under this save_dir is dead weight -- superseded and
+    # never read again by _find_latest_checkpoint. keep_last_n=0 when
+    # final wipes them all instead of waiting for the next session's
+    # quarantine/orphan-prune scan (cell 8) to clean it up later.
+    _prune_old_checkpoints(save_dir, keep_step=step, keep_last_n=(0 if final else 1))
 
 
 def _load_quantized_base(device: str):
