@@ -1073,7 +1073,7 @@ def load_finetuned_devaware_model(lang: str, device: str = None, merge_lora: boo
         # on the meta device (zero memory) and the checkpoint is loaded
         # straight into place instead, so no duplicate ever exists.
         model = PeftModel.from_pretrained(
-            base_model, ckpt_dir, autocast_adapter_dtype=False, low_cpu_mem_usage=True
+            base_model, str(ckpt_dir), autocast_adapter_dtype=False, low_cpu_mem_usage=True
         )
     else:
         # Fallback: fresh full bf16 load. Only safe if this is the only
@@ -1087,7 +1087,7 @@ def load_finetuned_devaware_model(lang: str, device: str = None, merge_lora: boo
         # Same fp32-upcast-spike and modules_to_save-duplicate reasoning as
         # the base_model-reuse branch above.
         model = PeftModel.from_pretrained(
-            base_model, ckpt_dir, autocast_adapter_dtype=False, low_cpu_mem_usage=True
+            base_model, str(ckpt_dir), autocast_adapter_dtype=False, low_cpu_mem_usage=True
         )
 
     if merge_lora:
