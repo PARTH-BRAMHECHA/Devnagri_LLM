@@ -7,9 +7,19 @@ but says nothing about whether that improvement is usable for anything.
 This stage adds one downstream task so a BPC win can be checked against
 real task performance instead of standing alone.
 
-Task: XNLI (3-way natural language inference), Hindi subset -- the
-standard, widely-used labeled Hindi classification benchmark on the HF
-Hub, so there is no new data-collection step.
+Task: 3-way natural language inference (entailment / neutral /
+contradiction), one labeled dataset per language:
+  - hindi:   XNLI's Hindi subset (facebook/xnli, config "hi") -- the
+             standard, widely-used labeled Hindi NLI benchmark.
+  - marathi: IndicXNLI's Marathi subset (Divyanshu/indicxnli, config
+             "mr") -- a machine-translated XNLI covering 11 Indic
+             languages, Marathi included. Same premise/hypothesis/label
+             (0=entailment, 1=neutral, 2=contradiction) shape as XNLI,
+             so every downstream function below is unchanged; only
+             _load_task_examples() picks the source per language.
+  - sanskrit: no task wired up. Neither XNLI nor IndicXNLI (nor any
+             other NLI benchmark found as of writing) has a Sanskrit
+             subset -- see TASK_LANG_CODE below.
 
 Method: a FROZEN-representation linear probe (sklearn LogisticRegression
 on last-token-pooled hidden-state features), not end-to-end fine-tuning.
@@ -52,10 +62,32 @@ from pipeline.config import (
 )
 from pipeline.error_diagnostics import run_with_diagnostics
 
-# XNLI only ships a Hindi subset -- Marathi/Sanskrit have no equivalent
-# labeled NLI set on the Hub as of writing. Extend this map if/when one
-# becomes available rather than silently reusing Hindi's.
+# facebook/xnli only ships a Hindi subset.
 XNLI_LANG_CODE = {"hindi": "hi"}
+
+# Divyanshu/indicxnli (IndicXNLI, machine-translated XNLI) covers 11
+# Indic languages, Marathi included -- see
+# https://huggingface.co/datasets/Divyanshu/indicxnli
+INDICXNLI_LANG_CODE = {"marathi": "mr"}
+
+# Union used everywhere below to decide "does this language have a task
+# wired up at all". sanskrit is deliberately absent from BOTH maps above
+# -- neither XNLI nor IndicXNLI (nor any other NLI benchmark found as of
+# writing) has a Sanskrit subset. Extend the relevant map above if/when
+# one becomes available rather than silently reusing another language's.
+TASK_LANG_CODE = {**XNLI_LANG_CODE, **INDICXNLI_LANG_CODE}
+
+
+def _task_lang_code(lang: str):
+    """Returns (source, lang_code, task_name) for a supported language,
+    or None if no NLI task is wired up for it (currently: sanskrit)."""
+    if lang in XNLI_LANG_CODE:
+        code = XNLI_LANG_CODE[lang]
+        return "xnli", code, f"xnli-{code}"
+    if lang in INDICXNLI_LANG_CODE:
+        code = INDICXNLI_LANG_CODE[lang]
+        return "indicxnli", code, f"indicxnli-{code}"
+    return None
 
 DOWNSTREAM_TRAIN_CAP = 4000  # examples used to fit the probe (speed knob)
 DOWNSTREAM_EVAL_CAP = 1000   # examples used to score it
@@ -156,6 +188,74 @@ def _load_xnli_split(lang_code, seed, n_train, n_eval):
     return train_examples, eval_examples
 
 
+def _load_indicxnli_split(lang_code, seed, n_train, n_eval):
+    """IndicXNLI (Divyanshu/indicxnli) ships as a custom `datasets`
+    LOADING SCRIPT (a .py builder on the Hub), which recent `datasets`
+    versions (this project pins 5.0.1) no longer execute by default for
+    security reasons -- `load_dataset("Divyanshu/indicxnli", lang_code)`
+    will raise instead of silently working the way facebook/xnli does.
+
+    So this fetches the underlying JSON files directly via
+    huggingface_hub (already a pinned dependency) and parses them the
+    same way the dataset's own loading script does, bypassing the
+    script mechanism entirely. See:
+    https://huggingface.co/datasets/Divyanshu/indicxnli/blob/main/indicxnli.py
+
+    Returns plain lists of {"premise", "hypothesis", "label"} dicts --
+    _build_features() only ever does `ex["premise"]` etc., so this is a
+    drop-in match for what _load_xnli_split() returns (HF Dataset
+    objects support the same indexing, but don't require it).
+    """
+    import json
+    import random
+    from huggingface_hub import hf_hub_download
+
+    def _load_one(split_dir):
+        path = hf_hub_download(
+            repo_id="Divyanshu/indicxnli",
+            repo_type="dataset",
+            filename=f"forward/{split_dir}/xnli_{lang_code}.json",
+        )
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        # The dataset's own _generate_examples does the same unwrap:
+        # `data = data[list(data.keys())[0]]` -- the JSON is a dict with
+        # one top-level key wrapping the list of rows.
+        rows = raw[list(raw.keys())[0]]
+        return [
+            {
+                "premise": row["premise"],
+                "hypothesis": row["hypothesis"],
+                "label": int(row["label"]),
+            }
+            for row in rows
+        ]
+
+    train_all = _load_one("train")
+    eval_all = _load_one("dev")  # IndicXNLI's "dev" split == validation
+
+    rng = random.Random(seed)
+    rng.shuffle(train_all)
+    rng.shuffle(eval_all)
+    return train_all[:n_train], eval_all[:n_eval]
+
+
+def _load_task_examples(lang, seed, n_train, n_eval):
+    """Dispatches to the right dataset for `lang` based on TASK_LANG_CODE
+    / _task_lang_code(). Returns (task_name, train_examples, eval_examples).
+    Raises KeyError if `lang` has no task wired up -- callers should
+    check _task_lang_code(lang) is not None first (all of them already
+    do, to print the "no downstream task" message and return None)."""
+    source, lang_code, task_name = _task_lang_code(lang)
+    if source == "xnli":
+        train_examples, eval_examples = _load_xnli_split(lang_code, seed, n_train, n_eval)
+    elif source == "indicxnli":
+        train_examples, eval_examples = _load_indicxnli_split(lang_code, seed, n_train, n_eval)
+    else:
+        raise ValueError(f"Unknown task source {source!r} for lang={lang!r}")
+    return task_name, train_examples, eval_examples
+
+
 # ---------------------------------------------------------------------------
 # Single-seed run (original behaviour, unchanged output format/filename)
 # ---------------------------------------------------------------------------
@@ -163,9 +263,9 @@ def _load_xnli_split(lang_code, seed, n_train, n_eval):
 def run_downstream(lang: str, seed: int = None, device: str = None,
                     n_train: int = DOWNSTREAM_TRAIN_CAP, n_eval: int = DOWNSTREAM_EVAL_CAP,
                     pooling: str = "last"):
-    if lang not in XNLI_LANG_CODE:
-        print(f"  ⚠ No downstream task wired up for '{lang}' yet -- XNLI only "
-              f"covers {list(XNLI_LANG_CODE)}. Skipping.")
+    if _task_lang_code(lang) is None:
+        print(f"  ⚠ No downstream task wired up for '{lang}' yet -- covers "
+              f"{list(TASK_LANG_CODE)}. Skipping.")
         return None
 
     from transformers import AutoTokenizer
@@ -173,14 +273,14 @@ def run_downstream(lang: str, seed: int = None, device: str = None,
 
     ensure_dirs()
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    lang_code = XNLI_LANG_CODE[lang]
     run_seed = seed if seed is not None else SEED
 
+    task_name, train_examples, eval_examples = _load_task_examples(
+        lang, run_seed, n_train, n_eval
+    )
     print(f"\n{'='*70}")
-    print(f"  STAGE 6: DOWNSTREAM TASK EVAL ({lang}, XNLI-{lang_code}, pooling={pooling})")
+    print(f"  STAGE 6: DOWNSTREAM TASK EVAL ({lang}, {task_name}, pooling={pooling})")
     print(f"{'='*70}")
-
-    train_examples, eval_examples = _load_xnli_split(lang_code, run_seed, n_train, n_eval)
     print(f"  Train probe on {len(train_examples)} examples, "
           f"eval on {len(eval_examples)}.")
 
@@ -210,7 +310,7 @@ def run_downstream(lang: str, seed: int = None, device: str = None,
         acc, f1 = _fit_and_score(X_train, y_train, X_eval, y_eval, C=1.0)
 
         results[cond_name] = {
-            "task": f"xnli-{lang_code}",
+            "task": task_name,
             "pooling": pooling,
             "n_train": len(train_examples),
             "n_eval": len(eval_examples),
@@ -253,11 +353,11 @@ def run_downstream(lang: str, seed: int = None, device: str = None,
 # features, aggregates with a bootstrap CI, and flags CI overlap.
 # ---------------------------------------------------------------------------
 
-def _run_one_seed(lang, lang_code, seed, device, n_train, n_eval, pooling):
+def _run_one_seed(lang, seed, device, n_train, n_eval, pooling):
     from transformers import AutoTokenizer
     from pipeline.stage2d_vocab_extend import load_finetuned_devaware_model
 
-    train_examples, eval_examples = _load_xnli_split(lang_code, seed, n_train, n_eval)
+    _, train_examples, eval_examples = _load_task_examples(lang, seed, n_train, n_eval)
 
     print(f"\n  [seed={seed}] loading fine-tuned checkpoint...")
     model, devaware_tokenizer = load_finetuned_devaware_model(
@@ -303,22 +403,22 @@ def run_downstream_multiseed(lang: str, seeds, device: str = None,
                               n_train: int = DOWNSTREAM_TRAIN_CAP,
                               n_eval: int = DOWNSTREAM_EVAL_CAP,
                               pooling: str = "last"):
-    if lang not in XNLI_LANG_CODE:
+    if _task_lang_code(lang) is None:
         print(f"  ⚠ No downstream task wired up for '{lang}' yet. Skipping.")
         return None
 
     ensure_dirs()
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    lang_code = XNLI_LANG_CODE[lang]
+    _, _, task_name = _task_lang_code(lang)
 
     print(f"\n{'='*70}")
-    print(f"  STAGE 6 (multi-seed): {lang}, XNLI-{lang_code}, "
+    print(f"  STAGE 6 (multi-seed): {lang}, {task_name}, "
           f"pooling={pooling}, seeds={seeds}")
     print(f"{'='*70}")
 
     per_seed = {"devaware_tokenizer": [], "default_tokenizer": []}
     for seed in seeds:
-        seed_result = _run_one_seed(lang, lang_code, seed, device, n_train, n_eval, pooling)
+        seed_result = _run_one_seed(lang, seed, device, n_train, n_eval, pooling)
         for cond in per_seed:
             per_seed[cond].append(seed_result[cond])
 
@@ -393,24 +493,24 @@ def run_downstream_one_seed_and_save(lang, seed, device=None,
     result (accuracy/macro_f1 per tokenizer condition -- no model weights)
     to results/<lang>/downstream_per_seed/seed_<N>.json. Returns None
     without writing anything if `lang` has no downstream task wired up
-    (see XNLI_LANG_CODE) -- safe to call unconditionally per-seed from a
+    (see TASK_LANG_CODE) -- safe to call unconditionally per-seed from a
     generic multi-language driver.
     """
-    if lang not in XNLI_LANG_CODE:
+    if _task_lang_code(lang) is None:
         print(f"  ⚠ No downstream task wired up for '{lang}' yet. Skipping "
               f"(seed={seed} training-loss numbers are unaffected).")
         return None
 
     ensure_dirs()
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    lang_code = XNLI_LANG_CODE[lang]
+    _, _, task_name = _task_lang_code(lang)
 
     print(f"\n{'='*70}")
-    print(f"  STAGE 6 (single seed, save-only): {lang}, XNLI-{lang_code}, "
+    print(f"  STAGE 6 (single seed, save-only): {lang}, {task_name}, "
           f"seed={seed}, pooling={pooling}")
     print(f"{'='*70}")
 
-    seed_result = _run_one_seed(lang, lang_code, seed, device, n_train, n_eval, pooling)
+    seed_result = _run_one_seed(lang, seed, device, n_train, n_eval, pooling)
 
     per_seed_dir = RESULTS_DIR / lang / "downstream_per_seed"
     per_seed_dir.mkdir(parents=True, exist_ok=True)
