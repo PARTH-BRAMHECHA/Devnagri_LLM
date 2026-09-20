@@ -17,9 +17,19 @@ contradiction), one labeled dataset per language:
              (0=entailment, 1=neutral, 2=contradiction) shape as XNLI,
              so every downstream function below is unchanged; only
              _load_task_examples() picks the source per language.
-  - sanskrit: no task wired up. Neither XNLI nor IndicXNLI (nor any
-             other NLI benchmark found as of writing) has a Sanskrit
-             subset -- see TASK_LANG_CODE below.
+  - sanskrit: XNLI 2.0's Sanskrit subset (mteb/xnli2.0-multi-pair,
+             config "sanskrit") -- a SECOND, INDEPENDENT machine
+             translation of XNLI (Upadhyay & Upadhya, IEEE I2CT 2023),
+             covering 13 languages including Sanskrit, which neither
+             XNLI nor IndicXNLI has. Lower confidence than the Hindi/
+             Marathi sources: published at a smaller venue, and this
+             repo ships ONLY a "test" split (5010 rows, no separate
+             train) -- see _load_xnli20_split() for how that pool gets
+             divided into a probe-train and a held-out probe-eval slice.
+             Spot-checking the raw text also shows some residual
+             code-switched English fragments in the MT output
+             (numbers, acronyms, a few whole clauses) -- expect noisier
+             numbers than Hindi's.
 
 Method: a FROZEN-representation linear probe (sklearn LogisticRegression
 on last-token-pooled hidden-state features), not end-to-end fine-tuning.
@@ -70,23 +80,34 @@ XNLI_LANG_CODE = {"hindi": "hi"}
 # https://huggingface.co/datasets/Divyanshu/indicxnli
 INDICXNLI_LANG_CODE = {"marathi": "mr"}
 
+# mteb/xnli2.0-multi-pair (XNLI 2.0, a SECOND independent machine
+# translation of XNLI -- Upadhyay & Upadhya, IEEE I2CT 2023) covers 13
+# languages including Sanskrit, which is in neither XNLI nor IndicXNLI.
+# Lower-confidence source than the two above -- see the module docstring
+# for the caveats (smaller venue, test-only split, some residual
+# code-switched English in spot checks). config_name IS the language
+# name (e.g. "sanskrit"), not an ISO code.
+XNLI20_LANG_CODE = {"sanskrit": "sanskrit"}
+
 # Union used everywhere below to decide "does this language have a task
-# wired up at all". sanskrit is deliberately absent from BOTH maps above
-# -- neither XNLI nor IndicXNLI (nor any other NLI benchmark found as of
-# writing) has a Sanskrit subset. Extend the relevant map above if/when
-# one becomes available rather than silently reusing another language's.
-TASK_LANG_CODE = {**XNLI_LANG_CODE, **INDICXNLI_LANG_CODE}
+# wired up at all". Extend the relevant map above if a better source
+# becomes available for a language, rather than silently reusing
+# another language's.
+TASK_LANG_CODE = {**XNLI_LANG_CODE, **INDICXNLI_LANG_CODE, **XNLI20_LANG_CODE}
 
 
 def _task_lang_code(lang: str):
     """Returns (source, lang_code, task_name) for a supported language,
-    or None if no NLI task is wired up for it (currently: sanskrit)."""
+    or None if no NLI task is wired up for it."""
     if lang in XNLI_LANG_CODE:
         code = XNLI_LANG_CODE[lang]
         return "xnli", code, f"xnli-{code}"
     if lang in INDICXNLI_LANG_CODE:
         code = INDICXNLI_LANG_CODE[lang]
         return "indicxnli", code, f"indicxnli-{code}"
+    if lang in XNLI20_LANG_CODE:
+        code = XNLI20_LANG_CODE[lang]
+        return "xnli20", code, f"xnli20-{code}"
     return None
 
 DOWNSTREAM_TRAIN_CAP = 4000  # examples used to fit the probe (speed knob)
@@ -240,6 +261,47 @@ def _load_indicxnli_split(lang_code, seed, n_train, n_eval):
     return train_all[:n_train], eval_all[:n_eval]
 
 
+def _source_caveat(lang: str):
+    """One-line data-quality caveat to attach to results, when the task
+    source for `lang` warrants flagging it (currently: xnli20, used only
+    for sanskrit). Returns None for sources with no caveat needed."""
+    info = _task_lang_code(lang)
+    if info and info[0] == "xnli20":
+        return (
+            "Task data is XNLI 2.0's machine-translated Sanskrit subset "
+            "(mteb/xnli2.0-multi-pair, Upadhyay & Upadhya, IEEE I2CT "
+            "2023) -- a smaller-venue, single independent MT pass, with "
+            "only a 5010-row test pool (no separate train split; this "
+            "run's train/eval came from an internal split of that pool, "
+            "see _load_xnli20_split). Spot checks show occasional "
+            "code-switched English fragments in the translation. Treat "
+            "this number as noisier and lower-confidence than the "
+            "hindi (facebook/xnli) or marathi (IndicXNLI) results."
+        )
+    return None
+
+
+def _load_xnli20_split(lang_code, seed, n_train, n_eval):
+    """XNLI 2.0's Sanskrit subset (mteb/xnli2.0-multi-pair, config
+    "sanskrit") ships ONLY a "test" split (5010 rows) -- there is no
+    separate train split to fit the probe on, unlike facebook/xnli and
+    IndicXNLI. So this shuffles the single pool with `seed` and splits
+    it into a probe-eval slice (held out, scored on) and a probe-train
+    slice (everything else, capped at n_train), the same way
+    _pick_best_C() already splits TRAIN into a val slice elsewhere in
+    this file -- never let the same row appear in both. The dataset is
+    parquet-backed (not a custom loading script), so plain
+    `datasets.load_dataset` works fine with no trust_remote_code needed.
+    """
+    from datasets import load_dataset
+    ds = load_dataset("mteb/xnli2.0-multi-pair", lang_code)["test"].shuffle(seed=seed)
+    n_eval = min(n_eval, len(ds) // 4)  # leave most of the pool for training the probe
+    eval_examples = ds.select(range(n_eval))
+    train_pool = ds.select(range(n_eval, len(ds)))
+    train_examples = train_pool.select(range(min(n_train, len(train_pool))))
+    return train_examples, eval_examples
+
+
 def _load_task_examples(lang, seed, n_train, n_eval):
     """Dispatches to the right dataset for `lang` based on TASK_LANG_CODE
     / _task_lang_code(). Returns (task_name, train_examples, eval_examples).
@@ -251,6 +313,8 @@ def _load_task_examples(lang, seed, n_train, n_eval):
         train_examples, eval_examples = _load_xnli_split(lang_code, seed, n_train, n_eval)
     elif source == "indicxnli":
         train_examples, eval_examples = _load_indicxnli_split(lang_code, seed, n_train, n_eval)
+    elif source == "xnli20":
+        train_examples, eval_examples = _load_xnli20_split(lang_code, seed, n_train, n_eval)
     else:
         raise ValueError(f"Unknown task source {source!r} for lang={lang!r}")
     return task_name, train_examples, eval_examples
@@ -328,6 +392,7 @@ def run_downstream(lang: str, seed: int = None, device: str = None,
         "pooling": pooling,
         "probe": f"sklearn LogisticRegression on {pooling}-pooled frozen last-hidden-state",
         "accuracy_delta_devaware_minus_default": round(dev_acc - def_acc, 4),
+        "data_source_caveat": _source_caveat(lang),
         "note": (
             "Same fine-tuned model weights for both conditions -- only the "
             "tokenizer changes. A single run at one seed; treat like the BPC "
@@ -448,6 +513,7 @@ def run_downstream_multiseed(lang: str, seeds, device: str = None,
         "seeds": list(seeds),
         "accuracy_delta_devaware_minus_default": round(float(delta), 4),
         "ci95_overlap": ci_overlap,
+        "data_source_caveat": _source_caveat(lang),
         "note": (
             "CIs computed via bootstrap over per-seed accuracies. If "
             "ci95_overlap is True, the delta is not distinguishable from "
@@ -581,6 +647,7 @@ def aggregate_downstream_from_saved(lang, seeds, n_train=DOWNSTREAM_TRAIN_CAP,
         "accuracy_delta_devaware_minus_default": round(float(delta), 4),
         "ci95_overlap": ci_overlap,
         "aggregated_from_saved_per_seed_results": True,
+        "data_source_caveat": _source_caveat(lang),
         "note": (
             "CIs computed via bootstrap over per-seed accuracies, "
             "aggregated from saved per-seed results (no checkpoint "
