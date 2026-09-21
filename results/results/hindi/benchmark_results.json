@@ -1,0 +1,183 @@
+{
+  "language": "hindi",
+  "test_chars": 2244197,
+  "test_bytes": 5703559,
+  "pure_language": {
+    "label": "hindi_pure",
+    "original_bytes": 5703559,
+    "original_chars": 2244197,
+    "char_entropy": 5.1208,
+    "byte_entropy": 3.6897,
+    "compressors": {
+      "gzip-9": {
+        "compressed_bytes": 1178348,
+        "ratio": 4.8403,
+        "bpc": 4.2005,
+        "bpb": 1.6528,
+        "time_s": 2.392
+      },
+      "bzip2-9": {
+        "compressed_bytes": 802586,
+        "ratio": 7.1065,
+        "bpc": 2.861,
+        "bpb": 1.1257,
+        "time_s": 0.518
+      },
+      "lzma": {
+        "compressed_bytes": 835072,
+        "ratio": 6.83,
+        "bpc": 2.9768,
+        "bpb": 1.1713,
+        "time_s": 4.468
+      },
+      "zstd-19": {
+        "compressed_bytes": 850649,
+        "ratio": 6.7049,
+        "bpc": 3.0324,
+        "bpb": 1.1931,
+        "time_s": 3.933
+      },
+      "gzip+bzip2": {
+        "compressed_bytes": 1184112,
+        "ratio": 4.8167,
+        "bpc": 4.2211,
+        "bpb": 1.6609,
+        "time_s": 2.564
+      },
+      "gzip+lzma": {
+        "compressed_bytes": 1178468,
+        "ratio": 4.8398,
+        "bpc": 4.2009,
+        "bpb": 1.653,
+        "time_s": 2.764
+      }
+    }
+  },
+  "llm_default_tokenizer": {
+    "model": "ai4bharat/Airavata",
+    "tokenizer": "model_default",
+    "total_bits": 107851.92672255082,
+    "total_chars": 50000,
+    "total_bytes": 127730,
+    "total_tokens": 19515,
+    "bpc": 2.157,
+    "bpb": 0.8444,
+    "bits_per_token": 5.5266,
+    "compression_ratio": 9.4745
+  },
+  "llm_devaware_tokenizer": {
+    "model": "ai4bharat/Airavata (vocab-extended, LoRA fine-tuned)",
+    "tokenizer": "devaware",
+    "total_bits": 96213.0267556824,
+    "total_chars": 50000,
+    "total_bytes": 127730,
+    "total_tokens": 17937,
+    "bpc": 1.9243,
+    "bpb": 0.7533,
+    "bits_per_token": 5.3639,
+    "compression_ratio": 10.6206,
+    "bootstrap_ci": {
+      "n_blocks": 36,
+      "n_boot": 2000,
+      "ci_level": 0.95,
+      "bits_per_token": 5.3634,
+      "bits_per_token_ci_low": 5.2179,
+      "bits_per_token_ci_high": 5.515,
+      "bits_per_token_ci_width": 0.2971
+    }
+  },
+  "llm_base_devaware_tokenizer": {
+    "model": "ai4bharat/Airavata (vocab-extended, smart-init, NOT fine-tuned)",
+    "tokenizer": "devaware",
+    "total_bits": 110872.16191803591,
+    "total_chars": 50000,
+    "total_bytes": 127730,
+    "total_tokens": 17937,
+    "bpc": 2.2174,
+    "bpb": 0.868,
+    "bits_per_token": 6.1812,
+    "compression_ratio": 9.2164
+  },
+  "llm_finetuned_default_tokenizer": {
+    "model": "ai4bharat/Airavata (vocab-extended, LoRA fine-tuned)",
+    "tokenizer": "model_default",
+    "total_bits": 97439.97981964724,
+    "total_chars": 50000,
+    "total_bytes": 127730,
+    "total_tokens": 19515,
+    "bpc": 1.9488,
+    "bpb": 0.7629,
+    "bits_per_token": 4.9931,
+    "compression_ratio": 10.4869,
+    "bootstrap_ci": {
+      "n_blocks": 39,
+      "n_boot": 2000,
+      "ci_level": 0.95,
+      "bits_per_token": 4.9925,
+      "bits_per_token_ci_low": 4.8559,
+      "bits_per_token_ci_high": 5.1312,
+      "bits_per_token_ci_width": 0.2753
+    }
+  },
+  "llm_generated": {
+    "label": "hindi_llm_generated",
+    "original_bytes": 51540,
+    "original_chars": 20000,
+    "char_entropy": 5.0006,
+    "byte_entropy": 3.6153,
+    "compressors": {
+      "gzip-9": {
+        "compressed_bytes": 12058,
+        "ratio": 4.2743,
+        "bpc": 4.8232,
+        "bpb": 1.8716,
+        "time_s": 0.016
+      },
+      "bzip2-9": {
+        "compressed_bytes": 8969,
+        "ratio": 5.7465,
+        "bpc": 3.5876,
+        "bpb": 1.3922,
+        "time_s": 0.005
+      },
+      "lzma": {
+        "compressed_bytes": 10876,
+        "ratio": 4.7389,
+        "bpc": 4.3504,
+        "bpb": 1.6882,
+        "time_s": 0.035
+      },
+      "zstd-19": {
+        "compressed_bytes": 11078,
+        "ratio": 4.6525,
+        "bpc": 4.4312,
+        "bpb": 1.7195,
+        "time_s": 0.034
+      },
+      "gzip+bzip2": {
+        "compressed_bytes": 12527,
+        "ratio": 4.1143,
+        "bpc": 5.0108,
+        "bpb": 1.9444,
+        "time_s": 0.019
+      },
+      "gzip+lzma": {
+        "compressed_bytes": 12120,
+        "ratio": 4.2525,
+        "bpc": 4.848,
+        "bpb": 1.8813,
+        "time_s": 0.028
+      }
+    },
+    "llm_default_tokenizer": {
+      "total_bits": 39778.4967909102,
+      "total_chars": 20000,
+      "total_bytes": 51540,
+      "total_tokens": 6871,
+      "bpc": 1.9889,
+      "bpb": 0.7718,
+      "bits_per_token": 5.7893,
+      "compression_ratio": 10.3654
+    }
+  }
+}

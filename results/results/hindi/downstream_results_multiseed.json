@@ -1,0 +1,129 @@
+{
+  "devaware_tokenizer": {
+    "pooling": "last",
+    "n_train": 4000,
+    "n_eval": 1000,
+    "per_seed": [
+      {
+        "seed": 0,
+        "best_C": 0.01,
+        "C_sweep_val_acc": {
+          "0.01": 0.5,
+          "0.1": 0.46625,
+          "1.0": 0.44875,
+          "10.0": 0.43875
+        },
+        "accuracy": 0.514,
+        "macro_f1": 0.513,
+        "elapsed_s": 3359.2
+      },
+      {
+        "seed": 1,
+        "best_C": 0.01,
+        "C_sweep_val_acc": {
+          "0.01": 0.50875,
+          "0.1": 0.4875,
+          "1.0": 0.47375,
+          "10.0": 0.47375
+        },
+        "accuracy": 0.496,
+        "macro_f1": 0.496,
+        "elapsed_s": 3444.4
+      },
+      {
+        "seed": 2,
+        "best_C": 0.01,
+        "C_sweep_val_acc": {
+          "0.01": 0.505,
+          "0.1": 0.49,
+          "1.0": 0.48875,
+          "10.0": 0.48375
+        },
+        "accuracy": 0.46,
+        "macro_f1": 0.461,
+        "elapsed_s": 3409.3
+      }
+    ],
+    "accuracy_mean": 0.49,
+    "accuracy_std": 0.022449944320643643,
+    "accuracy_ci95": [
+      0.46,
+      0.514
+    ],
+    "macro_f1_mean": 0.49,
+    "macro_f1_std": 0.021648710508172686,
+    "macro_f1_ci95": [
+      0.461,
+      0.513
+    ]
+  },
+  "default_tokenizer": {
+    "pooling": "last",
+    "n_train": 4000,
+    "n_eval": 1000,
+    "per_seed": [
+      {
+        "seed": 0,
+        "best_C": 0.01,
+        "C_sweep_val_acc": {
+          "0.01": 0.52125,
+          "0.1": 0.48125,
+          "1.0": 0.46875,
+          "10.0": 0.46
+        },
+        "accuracy": 0.499,
+        "macro_f1": 0.4976,
+        "elapsed_s": 3441.3
+      },
+      {
+        "seed": 1,
+        "best_C": 0.01,
+        "C_sweep_val_acc": {
+          "0.01": 0.525,
+          "0.1": 0.5125,
+          "1.0": 0.49875,
+          "10.0": 0.5075
+        },
+        "accuracy": 0.515,
+        "macro_f1": 0.5125,
+        "elapsed_s": 3467.1
+      },
+      {
+        "seed": 2,
+        "best_C": 0.01,
+        "C_sweep_val_acc": {
+          "0.01": 0.5025,
+          "0.1": 0.49625,
+          "1.0": 0.48375,
+          "10.0": 0.47375
+        },
+        "accuracy": 0.486,
+        "macro_f1": 0.4851,
+        "elapsed_s": 3510.8
+      }
+    ],
+    "accuracy_mean": 0.5,
+    "accuracy_std": 0.011860297916438141,
+    "accuracy_ci95": [
+      0.486,
+      0.515
+    ],
+    "macro_f1_mean": 0.4984,
+    "macro_f1_std": 0.01120029761509338,
+    "macro_f1_ci95": [
+      0.4850999999999999,
+      0.5125
+    ]
+  },
+  "_meta": {
+    "seeds": [
+      0,
+      1,
+      2
+    ],
+    "accuracy_delta_devaware_minus_default": -0.01,
+    "ci95_overlap": true,
+    "aggregated_from_saved_per_seed_results": true,
+    "note": "CIs computed via bootstrap over per-seed accuracies, aggregated from saved per-seed results (no checkpoint reload needed). If ci95_overlap is True, the delta is not distinguishable from noise at this seed count -- do not report a winner."
+  }
+}

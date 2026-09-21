@@ -1,0 +1,99 @@
+{
+  "language": "hindi",
+  "classical": {
+    "gzip": {
+      "compressed_bytes": 1178348,
+      "ratio": 4.8403,
+      "bpc": 4.2005,
+      "bpb": 1.6528
+    },
+    "bzip2": {
+      "compressed_bytes": 802586,
+      "ratio": 7.1065,
+      "bpc": 2.861,
+      "bpb": 1.1257
+    },
+    "lzma": {
+      "compressed_bytes": 835072,
+      "ratio": 6.83,
+      "bpc": 2.9768,
+      "bpb": 1.1713
+    },
+    "zstd": {
+      "compressed_bytes": 850649,
+      "ratio": 6.7049,
+      "bpc": 3.0324,
+      "bpb": 1.1931
+    },
+    "_meta": {
+      "original_bytes": 5703559,
+      "original_chars": 2244197
+    }
+  },
+  "llm_compression": {
+    "model": "ai4bharat/Airavata",
+    "tokenizer": "model_default",
+    "total_bits": 107851.92672255082,
+    "total_chars": 50000,
+    "total_bytes": 127730,
+    "total_tokens": 19515,
+    "bpc": 2.157,
+    "bpb": 0.8444,
+    "bits_per_token": 5.5266,
+    "compression_ratio": 9.4745
+  },
+  "llm_compression_devaware_tokenizer": {
+    "model": "ai4bharat/Airavata (vocab-extended, LoRA fine-tuned)",
+    "tokenizer": "devaware",
+    "total_bits": 96213.0267556824,
+    "total_chars": 50000,
+    "total_bytes": 127730,
+    "total_tokens": 17937,
+    "bpc": 1.9243,
+    "bpb": 0.7533,
+    "bits_per_token": 5.3639,
+    "compression_ratio": 10.6206,
+    "bootstrap_ci": {
+      "n_blocks": 36,
+      "n_boot": 2000,
+      "ci_level": 0.95,
+      "bits_per_token": 5.3634,
+      "bits_per_token_ci_low": 5.2179,
+      "bits_per_token_ci_high": 5.515,
+      "bits_per_token_ci_width": 0.2971
+    }
+  },
+  "llm_compression_base_devaware_tokenizer": {
+    "model": "ai4bharat/Airavata (vocab-extended, smart-init, NOT fine-tuned)",
+    "tokenizer": "devaware",
+    "total_bits": 110872.16191803591,
+    "total_chars": 50000,
+    "total_bytes": 127730,
+    "total_tokens": 17937,
+    "bpc": 2.2174,
+    "bpb": 0.868,
+    "bits_per_token": 6.1812,
+    "compression_ratio": 9.2164
+  },
+  "llm_compression_finetuned_default_tokenizer": {
+    "model": "ai4bharat/Airavata (vocab-extended, LoRA fine-tuned)",
+    "tokenizer": "model_default",
+    "total_bits": 97439.97981964724,
+    "total_chars": 50000,
+    "total_bytes": 127730,
+    "total_tokens": 19515,
+    "bpc": 1.9488,
+    "bpb": 0.7629,
+    "bits_per_token": 4.9931,
+    "compression_ratio": 10.4869,
+    "bootstrap_ci": {
+      "n_blocks": 39,
+      "n_boot": 2000,
+      "ci_level": 0.95,
+      "bits_per_token": 4.9925,
+      "bits_per_token_ci_low": 4.8559,
+      "bits_per_token_ci_high": 5.1312,
+      "bits_per_token_ci_width": 0.2753
+    }
+  }
+}

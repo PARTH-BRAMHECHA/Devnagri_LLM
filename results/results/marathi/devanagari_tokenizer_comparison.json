@@ -1,0 +1,21 @@
+{
+  "devanagari_aware": {
+    "tokenizer": "DevAware-BPE-marathi",
+    "sentences": 5000,
+    "avg_tokens_per_sentence": 25.94,
+    "total_tokens": 129688,
+    "total_chars": 636992,
+    "tokens_per_char": 0.2036,
+    "vowel_split_pct": 0.03
+  },
+  "baseline_bpe": {
+    "tokenizer": "SP-BPE-marathi",
+    "model_path": "/kaggle/working/Devnagri_LLM/tokenizer/marathi/sp_bpe_marathi.model",
+    "sentences": 5000,
+    "avg_tokens_per_sentence": 27.12,
+    "total_tokens": 135611,
+    "total_chars": 636992,
+    "tokens_per_char": 0.2129,
+    "vowel_split_pct": 2.27
+  }
+}

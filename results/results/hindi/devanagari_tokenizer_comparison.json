@@ -1,0 +1,21 @@
+{
+  "devanagari_aware": {
+    "tokenizer": "DevAware-BPE-hindi",
+    "sentences": 5000,
+    "avg_tokens_per_sentence": 65.54,
+    "total_tokens": 327693,
+    "total_chars": 1334381,
+    "tokens_per_char": 0.2456,
+    "vowel_split_pct": 0.03
+  },
+  "baseline_bpe": {
+    "tokenizer": "SP-BPE-hindi",
+    "model_path": "/kaggle/working/Devnagri_LLM/tokenizer/hindi/sp_bpe_hindi.model",
+    "sentences": 5000,
+    "avg_tokens_per_sentence": 67.8,
+    "total_tokens": 338996,
+    "total_chars": 1334381,
+    "tokens_per_char": 0.254,
+    "vowel_split_pct": 2.37
+  }
+}

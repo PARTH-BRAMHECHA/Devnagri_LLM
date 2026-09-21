@@ -1,0 +1,22 @@
+[
+  {
+    "tokenizer": "DevAware-BPE (no sandhi)",
+    "model_path": "/kaggle/working/Devnagri_LLM/tokenizer/sanskrit/devaware_bpe_sanskrit.model",
+    "sentences": 3855,
+    "avg_tokens_per_sentence": 592.19,
+    "total_tokens": 2282886,
+    "total_chars": 842947,
+    "tokens_per_char": 2.7082,
+    "vowel_split_pct": 0.0
+  },
+  {
+    "tokenizer": "DevAware-BPE (+ sandhi)",
+    "model_path": "/kaggle/working/Devnagri_LLM/tokenizer/sanskrit/devaware_bpe_sanskrit_sandhi.model",
+    "sentences": 3855,
+    "avg_tokens_per_sentence": 593.52,
+    "total_tokens": 2288021,
+    "total_chars": 856767,
+    "tokens_per_char": 2.6705,
+    "vowel_split_pct": 100.0
+  }
+]

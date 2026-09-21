@@ -1,0 +1,78 @@
+{
+  "0": {
+    "lang": "hindi",
+    "seed": 0,
+    "step": 3000,
+    "training_eval_loss": 2.79227694272995,
+    "training_eval_ppl": 16.31813298772739,
+    "elapsed_s": 280.126394033432,
+    "downstream": {
+      "devaware_tokenizer": {
+        "seed": 0,
+        "best_C": 0.01,
+        "C_sweep_val_acc": {
+          "0.01": 0.5,
+          "0.1": 0.46625,
+          "1.0": 0.44875,
+          "10.0": 0.43875
+        },
+        "accuracy": 0.514,
+        "macro_f1": 0.513,
+        "elapsed_s": 3359.2
+      },
+      "default_tokenizer": {
+        "seed": 0,
+        "best_C": 0.01,
+        "C_sweep_val_acc": {
+          "0.01": 0.52125,
+          "0.1": 0.48125,
+          "1.0": 0.46875,
+          "10.0": 0.46
+        },
+        "accuracy": 0.499,
+        "macro_f1": 0.4976,
+        "elapsed_s": 3441.3
+      }
+    },
+    "finalized_at": "2026-09-10T20:38:59Z",
+    "checkpoint_freed": true
+  },
+  "1": {
+    "lang": "hindi",
+    "seed": 1,
+    "step": 3000,
+    "training_eval_loss": 2.863354170322418,
+    "training_eval_ppl": 17.52019420702068,
+    "elapsed_s": 5710.442848205566,
+    "downstream": {
+      "devaware_tokenizer": {
+        "seed": 1,
+        "best_C": 0.01,
+        "C_sweep_val_acc": {
+          "0.01": 0.50875,
+          "0.1": 0.4875,
+          "1.0": 0.47375,
+          "10.0": 0.47375
+        },
+        "accuracy": 0.496,
+        "macro_f1": 0.496,
+        "elapsed_s": 3444.4
+      },
+      "default_tokenizer": {
+        "seed": 1,
+        "best_C": 0.01,
+        "C_sweep_val_acc": {
+          "0.01": 0.525,
+          "0.1": 0.5125,
+          "1.0": 0.49875,
+          "10.0": 0.5075
+        },
+        "accuracy": 0.515,
+        "macro_f1": 0.5125,
+        "elapsed_s": 3467.1
+      }
+    },
+    "finalized_at": "2026-09-10T23:18:39Z",
+    "checkpoint_freed": true
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "devaware_tokenizer": {
+    "seed": 0,
+    "best_C": 0.01,
+    "C_sweep_val_acc": {
+      "0.01": 0.5,
+      "0.1": 0.46625,
+      "1.0": 0.44875,
+      "10.0": 0.43875
+    },
+    "accuracy": 0.514,
+    "macro_f1": 0.513,
+    "elapsed_s": 3359.2
+  },
+  "default_tokenizer": {
+    "seed": 0,
+    "best_C": 0.01,
+    "C_sweep_val_acc": {
+      "0.01": 0.52125,
+      "0.1": 0.48125,
+      "1.0": 0.46875,
+      "10.0": 0.46
+    },
+    "accuracy": 0.499,
+    "macro_f1": 0.4976,
+    "elapsed_s": 3441.3
+  }
+}

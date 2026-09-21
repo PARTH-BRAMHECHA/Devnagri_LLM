@@ -1,0 +1,103 @@
+{
+  "devaware_tokenizer": {
+    "pooling": "last",
+    "n_train": 4000,
+    "n_eval": 1000,
+    "per_seed": [
+      {
+        "seed": 0,
+        "best_C": 0.01,
+        "C_sweep_val_acc": {
+          "0.01": 0.48125,
+          "0.1": 0.45625,
+          "1.0": 0.43375,
+          "10.0": 0.42625
+        },
+        "accuracy": 0.447,
+        "macro_f1": 0.4473,
+        "elapsed_s": 4102.6
+      },
+      {
+        "seed": 1,
+        "best_C": 0.01,
+        "C_sweep_val_acc": {
+          "0.01": 0.44125,
+          "0.1": 0.40875,
+          "1.0": 0.39375,
+          "10.0": 0.39375
+        },
+        "accuracy": 0.459,
+        "macro_f1": 0.4594,
+        "elapsed_s": 4084.7
+      }
+    ],
+    "accuracy_mean": 0.453,
+    "accuracy_std": 0.006000000000000005,
+    "accuracy_ci95": [
+      0.447,
+      0.459
+    ],
+    "macro_f1_mean": 0.45335,
+    "macro_f1_std": 0.00605,
+    "macro_f1_ci95": [
+      0.4473,
+      0.4594
+    ]
+  },
+  "default_tokenizer": {
+    "pooling": "last",
+    "n_train": 4000,
+    "n_eval": 1000,
+    "per_seed": [
+      {
+        "seed": 0,
+        "best_C": 0.01,
+        "C_sweep_val_acc": {
+          "0.01": 0.495,
+          "0.1": 0.44625,
+          "1.0": 0.41,
+          "10.0": 0.40625
+        },
+        "accuracy": 0.446,
+        "macro_f1": 0.4466,
+        "elapsed_s": 4288.4
+      },
+      {
+        "seed": 1,
+        "best_C": 0.01,
+        "C_sweep_val_acc": {
+          "0.01": 0.45125,
+          "0.1": 0.41625,
+          "1.0": 0.40125,
+          "10.0": 0.38625
+        },
+        "accuracy": 0.451,
+        "macro_f1": 0.4515,
+        "elapsed_s": 4368.8
+      }
+    ],
+    "accuracy_mean": 0.4485,
+    "accuracy_std": 0.0025000000000000022,
+    "accuracy_ci95": [
+      0.446,
+      0.451
+    ],
+    "macro_f1_mean": 0.44905,
+    "macro_f1_std": 0.0024500000000000077,
+    "macro_f1_ci95": [
+      0.4466,
+      0.4515
+    ]
+  },
+  "_meta": {
+    "seeds": [
+      0,
+      1
+    ],
+    "accuracy_delta_devaware_minus_default": 0.0045,
+    "ci95_overlap": true,
+    "aggregated_from_saved_per_seed_results": true,
+    "data_source_caveat": "Task data is XNLI 2.0's machine-translated Sanskrit subset (mteb/xnli2.0-multi-pair, Upadhyay & Upadhya, IEEE I2CT 2023) -- a smaller-venue, single independent MT pass, with only a 5010-row test pool (no separate train split; this run's train/eval came from an internal split of that pool, see _load_xnli20_split). Spot checks show occasional code-switched English fragments in the translation. Treat this number as noisier and lower-confidence than the hindi (facebook/xnli) or marathi (IndicXNLI) results.",
+    "note": "CIs computed via bootstrap over per-seed accuracies, aggregated from saved per-seed results (no checkpoint reload needed). If ci95_overlap is True, the delta is not distinguishable from noise at this seed count -- do not report a winner."
+  }
+}

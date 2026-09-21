@@ -1,0 +1,102 @@
+[
+  {
+    "tokenizer": "SP-BPE-hindi",
+    "model_path": "/kaggle/working/Devnagri_LLM/tokenizer/hindi/sp_bpe_hindi.model",
+    "sentences": 5000,
+    "avg_tokens_per_sentence": 67.8,
+    "total_tokens": 338996,
+    "total_chars": 1334381,
+    "tokens_per_char": 0.254,
+    "vowel_split_pct": 2.37
+  },
+  {
+    "tokenizer": "SP-Unigram-hindi",
+    "model_path": "/kaggle/working/Devnagri_LLM/tokenizer/hindi/sp_unigram_hindi.model",
+    "sentences": 5000,
+    "avg_tokens_per_sentence": 67.96,
+    "total_tokens": 339788,
+    "total_chars": 1334381,
+    "tokens_per_char": 0.2546,
+    "vowel_split_pct": 2.85
+  },
+  {
+    "tokenizer": "gpt2",
+    "model_path": "openai-community/gpt2",
+    "sentences": 5000,
+    "avg_tokens_per_sentence": 358.66,
+    "total_tokens": 1793316,
+    "total_chars": 1334381,
+    "tokens_per_char": 1.3439,
+    "vowel_split_pct": 0.0
+  },
+  {
+    "tokenizer": "Llama-2-7b-hf",
+    "model_path": "meta-llama/Llama-2-7b-hf",
+    "sentences": 5000,
+    "avg_tokens_per_sentence": 285.52,
+    "total_tokens": 1427616,
+    "total_chars": 1334381,
+    "tokens_per_char": 1.0699,
+    "vowel_split_pct": 100.0
+  },
+  {
+    "tokenizer": "gemma-2b",
+    "model_path": "google/gemma-2b",
+    "sentences": 5000,
+    "avg_tokens_per_sentence": 106.25,
+    "total_tokens": 531236,
+    "total_chars": 1334381,
+    "tokens_per_char": 0.3981,
+    "vowel_split_pct": 21.97
+  },
+  {
+    "tokenizer": "IndicBERTv2-MLM-only",
+    "model_path": "ai4bharat/IndicBERTv2-MLM-only",
+    "sentences": 5000,
+    "avg_tokens_per_sentence": 65.64,
+    "total_tokens": 328193,
+    "total_chars": 1334381,
+    "tokens_per_char": 0.246,
+    "vowel_split_pct": 3.77
+  },
+  {
+    "tokenizer": "sarvam-1",
+    "model_path": "sarvamai/sarvam-1",
+    "sentences": 5000,
+    "avg_tokens_per_sentence": 78.33,
+    "total_tokens": 391658,
+    "total_chars": 1334381,
+    "tokens_per_char": 0.2935,
+    "vowel_split_pct": 5.88
+  },
+  {
+    "tokenizer": "OpenHathi-7B-Hi-v0.1-Base",
+    "model_path": "sarvamai/OpenHathi-7B-Hi-v0.1-Base",
+    "sentences": 5000,
+    "avg_tokens_per_sentence": 100.06,
+    "total_tokens": 500313,
+    "total_chars": 1334381,
+    "tokens_per_char": 0.3749,
+    "vowel_split_pct": 9.14
+  },
+  {
+    "tokenizer": "Airavata",
+    "model_path": "ai4bharat/Airavata",
+    "sentences": 5000,
+    "avg_tokens_per_sentence": 100.06,
+    "total_tokens": 500313,
+    "total_chars": 1334381,
+    "tokens_per_char": 0.3749,
+    "vowel_split_pct": 9.14
+  },
+  {
+    "tokenizer": "aya-101",
+    "model_path": "CohereForAI/aya-101",
+    "sentences": 5000,
+    "avg_tokens_per_sentence": 107.13,
+    "total_tokens": 535642,
+    "total_chars": 1334381,
+    "tokens_per_char": 0.4014,
+    "vowel_split_pct": 12.32
+  }
+]
